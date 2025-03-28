@@ -202,6 +202,7 @@ public partial struct SpawnerSystem : ISystem {
 	}
 }
 
+[UpdateInGroup(typeof(SimulationSystemGroup))]
 public partial struct SpinningSystem : ISystem {
 	public struct Tag : IComponentData {}
 	
