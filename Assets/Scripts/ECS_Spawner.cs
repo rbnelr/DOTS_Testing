@@ -73,9 +73,9 @@ public struct Spawner : IComponentData {
 public partial struct SpawnerSystem : ISystem {
 	
 	static readonly ProfilerMarker perfDestroyAll = new ProfilerMarker("SpawnerSystem.DestroyAll");
-	static readonly ProfilerMarker perfSpawnAll = new ProfilerMarker(ProfilerCategory.Ai, "SpawnerSystem.SpawnAll");
-	static readonly ProfilerMarker perfSpawnAll1 = new ProfilerMarker(ProfilerCategory.Ai, "SpawnerSystem.SpawnAll1");
-	static readonly ProfilerMarker perfSpawnAll2 = new ProfilerMarker(ProfilerCategory.Ai, "SpawnerSystem.SpawnAll2");
+	static readonly ProfilerMarker perfSpawnAll  = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll");
+	static readonly ProfilerMarker perfSpawnAll1 = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll1");
+	static readonly ProfilerMarker perfSpawnAll2 = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll2");
 
 	public void OnCreate (ref SystemState state) {
 		//Debug.Log(">>>>> OnCreate");
@@ -84,6 +84,12 @@ public partial struct SpawnerSystem : ISystem {
 	public void OnStopRunning (ref SystemState state) {
 		Debug.Log(">>>>> OnStopRunning");
 		DestroyAll(ref state);
+
+		//if (SystemAPI.TryGetSingleton<Spawner>(out var spawn) && spawn.prefab_entity != Entity.Null) {
+		//	state.EntityManager.DestroyEntity(spawn.prefab_entity);
+		//	spawn.prefab_entity = Entity.Null;
+		//	SystemAPI.SetSingleton(spawn);
+		//}
 	}
 	
 	public void OnUpdate (ref SystemState state) {
