@@ -24,17 +24,14 @@ public class CustomEntityRenderer : MonoBehaviour {
 
 	public Mesh mesh;
 	public Material material;
-
+	
 	BatchRendererGroup brg = null;
-
-	BatchID batchID = BatchID.Null;
 	BatchMeshID meshID;
 	BatchMaterialID materialID;
-	
+
 	GraphicsBuffer instanceGraphicsBuffer = null;
 	NativeArray<MetadataValue> metadata;
-
-	GraphicsBufferPool bufferPool = new GraphicsBufferPool(3);
+	BatchID batchID = BatchID.Null;
 
 	public unsafe struct InstanceDataBuffer {
 		//public NativeSlice<float3x4> obj2world;
@@ -57,13 +54,23 @@ public class CustomEntityRenderer : MonoBehaviour {
 		materialID = brg.RegisterMaterial(material);
 	}
 	void OnDisable () {
-		if (brg != null)
-			brg.Dispose();
-		//if (instanceGraphicsBuffer != null)
-		//	instanceGraphicsBuffer.Dispose();
-		bufferPool.Dispose();
+		// Probably no need to remove batchID from brg
+		DisposeOf(ref brg);
+		DisposeOf(ref instanceGraphicsBuffer);
 	}
 	
+	static void DisposeOf<T> (ref T obj) where T: IDisposable {
+		if (obj != null) {
+			obj.Dispose();
+			obj = default(T);
+		}
+	}
+	void Remove (ref BatchID obj) {
+		if (obj != null) {
+			brg.RemoveBatch(obj);
+			obj = BatchID.Null;
+		}
+	}
 
 	public static float3x4 pack_matrix (float4x4 mat) {
 		return new float3x4(
@@ -89,11 +96,11 @@ public class CustomEntityRenderer : MonoBehaviour {
 	public unsafe InstanceDataBuffer ReallocateInstances (int NumInstances) {
 		perfAlloc.Begin();
 		
+		Debug.Log($"CustomEntityRenderer.ReallocateInstances() NumInstances: {NumInstances}");
+
 		//if (instanceBuf.raw.IsCreated)
 		//	instanceBuf.raw.Dispose();
-		//if (instanceGraphicsBuffer != null)
-		//	instanceGraphicsBuffer.Dispose(); // TODO: Only if size changed?
-		//instanceGraphicsBuffer = null;
+		DisposeOf(ref instanceGraphicsBuffer); // TODO: Only if size changed?
 
 		this.NumInstances = NumInstances;
 		InstanceDataBuffer buf = default;
@@ -106,16 +113,10 @@ public class CustomEntityRenderer : MonoBehaviour {
 			int offs2 = AddAligned(ref total_size, NumInstances * sizeof(float4), sizeof(float4)); // _BaseColor
 
 			//var instanceBufRaw = new NativeArray<byte>(total_size, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-
-			//instanceGraphicsBuffer = new GraphicsBuffer(
-			//	GraphicsBuffer.Target.Raw,
-			//	GraphicsBuffer.UsageFlags.LockBufferForWrite,
-			//	total_size / sizeof(int), sizeof(int));
-			
-			ref var instBuffer = ref bufferPool.GetNext();
-			instBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.LockBufferForWrite,
+			instanceGraphicsBuffer = new GraphicsBuffer(
+				GraphicsBuffer.Target.Raw,
+				GraphicsBuffer.UsageFlags.LockBufferForWrite,
 				total_size / sizeof(int), sizeof(int));
-			instanceGraphicsBuffer = instBuffer;
 
 			NativeArray<int> write_buf = instanceGraphicsBuffer.LockBufferForWrite<int>(0, instanceGraphicsBuffer.count);
 			var ptr = (byte*)write_buf.GetUnsafePtr();
@@ -151,8 +152,7 @@ public class CustomEntityRenderer : MonoBehaviour {
 	public void ReuploadInstanceGraphicsBuffer () {
 		perfUpload.Begin();
 
-		if (batchID != BatchID.Null)
-			brg.RemoveBatch(batchID);
+		Remove(ref batchID);
 
 		if (NumInstances > 0) {
 			//instanceGraphicsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.LockBufferForWrite,
@@ -247,41 +247,6 @@ public class CustomEntityRenderer : MonoBehaviour {
 	}
 }
 
-public struct GraphicsBufferPool : IDisposable {
-	GraphicsBuffer[] slots;
-	int next;
-
-	public ref GraphicsBuffer GetNext () {
-		// Get next buffer in cycling buffers
-		ref var buf = ref slots[next];
-		
-		Debug.Log($"GraphicsBufferPool Use and Dispose {next}");
-
-		// Dispose old (now multiple frames after use)
-		if (buf != null) {
-			buf.Dispose();
-			buf = null;
-		}
-
-		next = (next + 1) % slots.Length;
-		return ref buf;
-	}
-
-	public GraphicsBufferPool (int Slots) {
-		slots = new GraphicsBuffer[Slots];
-		for (int i=0; i<slots.Length; ++i)
-			slots[i] = null;
-		next = 0;
-	}
-	public void Dispose () {
-		for (int i=0; i<slots.Length; ++i) {
-			slots[i].Dispose();
-			slots[i] = null;
-		}
-	}
-
-}
-
 [UpdateInGroup(typeof(PresentationSystemGroup))]
 partial struct ComputeEntityInstancesSystem : ISystem {
 	CustomEntityRenderer renderer => CustomEntityRenderer.inst;
@@ -295,7 +260,7 @@ partial struct ComputeEntityInstancesSystem : ISystem {
 	public void OnUpdate (ref SystemState state) {
 		int NumInstances = query.CalculateEntityCount();
 
-		//Debug.Log($"ComputeEntityInstancesSystem.OnUpdate NumInstances: {NumInstances}");
+		Debug.Log($"ComputeEntityInstancesSystem.OnUpdate NumInstances: {NumInstances}");
 
 		var instanceBuf = renderer.ReallocateInstances(NumInstances);
 

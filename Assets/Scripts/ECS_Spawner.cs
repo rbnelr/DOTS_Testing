@@ -149,15 +149,15 @@ public partial struct SpawnerSystem : ISystem {
 		}
 
 		{
-			Debug.Log($">> spawner SpawnCount: {spawn.SpawnCount}");
+			//Debug.Log($">> spawner SpawnCount: {spawn.SpawnCount}");
 		
 			perfDestroyAll.Begin();
-			using (Timer.Start(t => Debug.Log($"DestroyAll took {t*1000}ms")))
+			//using (Timer.Start(t => Debug.Log($"DestroyAll took {t*1000}ms")))
 				DestroyAll(ref state);
 			perfDestroyAll.End();
 				
 			perfSpawnAll.Begin();
-			using (Timer.Start(t => Debug.Log($"SpawnAll took {t*1000}ms")))
+			//using (Timer.Start(t => Debug.Log($"SpawnAll took {t*1000}ms")))
 				SpawnAll(ref state, ref spawn);
 			perfSpawnAll.End();
 		}
