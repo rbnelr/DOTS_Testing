@@ -34,6 +34,8 @@ public class CustomEntityRenderer : MonoBehaviour {
 	GraphicsBuffer instanceGraphicsBuffer = null;
 	NativeArray<MetadataValue> metadata;
 
+	GraphicsBufferPool bufferPool = new GraphicsBufferPool(3);
+
 	public unsafe struct InstanceDataBuffer {
 		//public NativeSlice<float3x4> obj2world;
 		//public NativeSlice<float3x4> world2obj;
@@ -57,8 +59,9 @@ public class CustomEntityRenderer : MonoBehaviour {
 	void OnDisable () {
 		if (brg != null)
 			brg.Dispose();
-		if (instanceGraphicsBuffer != null)
-			instanceGraphicsBuffer.Dispose();
+		//if (instanceGraphicsBuffer != null)
+		//	instanceGraphicsBuffer.Dispose();
+		bufferPool.Dispose();
 	}
 	
 
@@ -88,9 +91,9 @@ public class CustomEntityRenderer : MonoBehaviour {
 		
 		//if (instanceBuf.raw.IsCreated)
 		//	instanceBuf.raw.Dispose();
-		if (instanceGraphicsBuffer != null)
-			instanceGraphicsBuffer.Dispose(); // TODO: Only if size changed?
-		instanceGraphicsBuffer = null;
+		//if (instanceGraphicsBuffer != null)
+		//	instanceGraphicsBuffer.Dispose(); // TODO: Only if size changed?
+		//instanceGraphicsBuffer = null;
 
 		this.NumInstances = NumInstances;
 		InstanceDataBuffer buf = default;
@@ -103,12 +106,18 @@ public class CustomEntityRenderer : MonoBehaviour {
 			int offs2 = AddAligned(ref total_size, NumInstances * sizeof(float4), sizeof(float4)); // _BaseColor
 
 			//var instanceBufRaw = new NativeArray<byte>(total_size, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-			instanceGraphicsBuffer = new GraphicsBuffer(
-				GraphicsBuffer.Target.Raw,
-				GraphicsBuffer.UsageFlags.LockBufferForWrite,
-				total_size / sizeof(int), sizeof(int));
-			NativeArray<int> write_buf = instanceGraphicsBuffer.LockBufferForWrite<int>(0, instanceGraphicsBuffer.count);
 
+			//instanceGraphicsBuffer = new GraphicsBuffer(
+			//	GraphicsBuffer.Target.Raw,
+			//	GraphicsBuffer.UsageFlags.LockBufferForWrite,
+			//	total_size / sizeof(int), sizeof(int));
+			
+			ref var instBuffer = ref bufferPool.GetNext();
+			instBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.LockBufferForWrite,
+				total_size / sizeof(int), sizeof(int));
+			instanceGraphicsBuffer = instBuffer;
+
+			NativeArray<int> write_buf = instanceGraphicsBuffer.LockBufferForWrite<int>(0, instanceGraphicsBuffer.count);
 			var ptr = (byte*)write_buf.GetUnsafePtr();
 			UnsafeUtility.MemSet(ptr, 0, 64);
 
@@ -236,6 +245,41 @@ public class CustomEntityRenderer : MonoBehaviour {
 		perfCmd.End();
 		return new JobHandle();
 	}
+}
+
+public struct GraphicsBufferPool : IDisposable {
+	GraphicsBuffer[] slots;
+	int next;
+
+	public ref GraphicsBuffer GetNext () {
+		// Get next buffer in cycling buffers
+		ref var buf = ref slots[next];
+		
+		Debug.Log($"GraphicsBufferPool Use and Dispose {next}");
+
+		// Dispose old (now multiple frames after use)
+		if (buf != null) {
+			buf.Dispose();
+			buf = null;
+		}
+
+		next = (next + 1) % slots.Length;
+		return ref buf;
+	}
+
+	public GraphicsBufferPool (int Slots) {
+		slots = new GraphicsBuffer[Slots];
+		for (int i=0; i<slots.Length; ++i)
+			slots[i] = null;
+		next = 0;
+	}
+	public void Dispose () {
+		for (int i=0; i<slots.Length; ++i) {
+			slots[i].Dispose();
+			slots[i] = null;
+		}
+	}
+
 }
 
 [UpdateInGroup(typeof(PresentationSystemGroup))]
