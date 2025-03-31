@@ -17,43 +17,78 @@ using UnityEngine.Rendering;
 using Unity.Burst;
 using Unity.Transforms;
 using Unity.Profiling;
+using Unity.Burst.Intrinsics;
+using Unity.Assertions;
 
-[BurstCompile]
 public class CustomEntityRenderer : MonoBehaviour {
-	public static CustomEntityRenderer inst;
-
 	public Mesh mesh;
 	public Material material;
+
+	void OnValidate () {
+		var world = World.DefaultGameObjectInjectionWorld;
+		var sys = world?.GetExistingSystem<CustomEntityRendererSystem>();
+		if (sys.HasValue && sys != SystemHandle.Null) {
+			world.EntityManager.SetComponentData(sys.Value, new CustomEntityRendererSystem.Input {
+				mesh = mesh,
+				material = material,
+			});
+		}
+	}
+}
+
+//[BurstCompile]
+[UpdateInGroup(typeof(PresentationSystemGroup))]
+[UpdateAfter(typeof(UpdatePresentationSystemGroup))]
+public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	
+	public class Input : IComponentData {
+		public Mesh mesh;
+		public Material material;
+	}
+
 	BatchRendererGroup brg = null;
-	BatchMeshID meshID;
-	BatchMaterialID materialID;
+	BatchMeshID meshID = BatchMeshID.Null;
+	BatchMaterialID materialID = BatchMaterialID.Null;
 
 	GraphicsBuffer instanceGraphicsBuffer = null;
 	NativeArray<MetadataValue> metadata;
 	BatchID batchID = BatchID.Null;
+	
+	EntityQuery query; // all renderable entities
 
 	public unsafe struct InstanceDataBuffer {
 		//public NativeSlice<float3x4> obj2world;
 		//public NativeSlice<float3x4> world2obj;
 		//public NativeSlice<float4> color;
+		// Pointers into instanceGraphicsBuffer which is locked for writing
 		public float3x4* obj2world;
 		public float3x4* world2obj;
 		public float4* color;
 	};
+	public InstanceDataBuffer instanceData { get; private set; }
+	
+	protected override void OnCreate () {
+		Debug.Log("CustomEntityRendererSystem.OnCreate");
 
-	void Start () {
-		//Debug.Log("CustomEntityRenderer.Start");
-		inst = this;
+		World.EntityManager.AddComponent<Input>(SystemHandle);
+	}
+	protected override void OnStartRunning () {
+		Debug.Log("CustomEntityRendererSystem.OnStartRunning");
+
+		var input = SystemAPI.ManagedAPI.GetComponent<Input>(SystemHandle);
 
 		brg = new BatchRendererGroup(OnPerformCulling, IntPtr.Zero);
 		// Register meshes and Materials, in my use case these would be fixed and remain in VRAM
 		// but CustomEntityRenderer might observe asset managers for potential reloads
 		// we might want to use BatchMeshID directly inside the to be rendered entities
-		meshID = brg.RegisterMesh(mesh);
-		materialID = brg.RegisterMaterial(material);
+		meshID = brg.RegisterMesh(input.mesh);
+		materialID = brg.RegisterMaterial(input.material);
+
+		query = new EntityQueryBuilder(Allocator.Temp).WithAll<CustomRenderAsset, LocalTransform>().Build(this);
 	}
-	void OnDisable () {
+	protected override void OnStopRunning () {
+		Debug.Log("CustomEntityRendererSystem.OnStopRunning");
+
 		// Probably no need to remove batchID from brg
 		DisposeOf(ref brg);
 		DisposeOf(ref instanceGraphicsBuffer);
@@ -88,22 +123,22 @@ public class CustomEntityRenderer : MonoBehaviour {
 	}
 
 	int NumInstances;
+	JobHandle cullJobDep;
+	NativeArray<int> entityIndices;
+
 	
 	static readonly ProfilerMarker perfAlloc  = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.ReallocateInstances");
 	static readonly ProfilerMarker perfUpload = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.ReuploadInstanceGraphicsBuffer");
 	static readonly ProfilerMarker perfCmd    = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.OnPerformCulling");
 	
-	public unsafe InstanceDataBuffer ReallocateInstances (int NumInstances) {
+	public unsafe void ReallocateInstances () {
 		perfAlloc.Begin();
 		
-		Debug.Log($"CustomEntityRenderer.ReallocateInstances() NumInstances: {NumInstances}");
+		//Debug.Log($"CustomEntityRenderer.ReallocateInstances() NumInstances: {NumInstances}");
 
-		//if (instanceBuf.raw.IsCreated)
-		//	instanceBuf.raw.Dispose();
 		DisposeOf(ref instanceGraphicsBuffer); // TODO: Only if size changed?
 
-		this.NumInstances = NumInstances;
-		InstanceDataBuffer buf = default;
+		instanceData = default;
 
 		if (NumInstances > 0) {
 
@@ -112,7 +147,6 @@ public class CustomEntityRenderer : MonoBehaviour {
 			int offs1 = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_WorldToObject
 			int offs2 = AddAligned(ref total_size, NumInstances * sizeof(float4), sizeof(float4)); // _BaseColor
 
-			//var instanceBufRaw = new NativeArray<byte>(total_size, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
 			instanceGraphicsBuffer = new GraphicsBuffer(
 				GraphicsBuffer.Target.Raw,
 				GraphicsBuffer.UsageFlags.LockBufferForWrite,
@@ -122,7 +156,7 @@ public class CustomEntityRenderer : MonoBehaviour {
 			var ptr = (byte*)write_buf.GetUnsafePtr();
 			UnsafeUtility.MemSet(ptr, 0, 64);
 
-			buf = new InstanceDataBuffer {
+			instanceData = new InstanceDataBuffer {
 				obj2world = (float3x4*)(ptr + offs0),
 				world2obj = (float3x4*)(ptr + offs1),
 				color = (float4*)(ptr + offs2),
@@ -133,12 +167,6 @@ public class CustomEntityRenderer : MonoBehaviour {
 				//color     = NativeSliceUnsafeUtility.ConvertExistingDataToNativeSlice<float4  >(ptr + offs2, sizeof(float4  ), NumInstances),
 			};
 
-			// Set up metadata values to point to the instance data. Set the most significant bit 0x80000000 in each
-			// which instructs the shader that the data is an array with one value per instance, indexed by the instance index.
-			// Any metadata values that the shader uses and not set here will be zero. When such a value is used with
-			// UNITY_ACCESS_DOTS_INSTANCED_PROP (i.e. without a default), the shader interprets the
-			// 0x00000000 metadata value and loads from the start of the buffer. The start of the buffer which is
-			// is a zero matrix so this sort of load is guaranteed to return zero, which is a reasonable default value.
 			metadata = new NativeArray<MetadataValue>(3, Allocator.Temp);
 			metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)offs0 };
 			metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)offs1 };
@@ -146,7 +174,6 @@ public class CustomEntityRenderer : MonoBehaviour {
 		}
 
 		perfAlloc.End();
-		return buf;
 	}
 
 	public void ReuploadInstanceGraphicsBuffer () {
@@ -167,8 +194,28 @@ public class CustomEntityRenderer : MonoBehaviour {
 		perfUpload.End();
 	}
 	
+	protected override void OnUpdate () {
+		NumInstances = query.CalculateEntityCount();
+
+		//Debug.Log($"CustomEntityRendererSystem.OnUpdate {NumInstances}");
+		
+		ReallocateInstances();
+
+		if (NumInstances > 0) {
+			var instDataJob = new ComputeInstanceDataJob{ instanceData = instanceData }
+				.ScheduleParallel(query, Dependency);
+
+			entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out cullJobDep);
+
+			instDataJob.Complete(); // Have to complete for ReuploadInstanceGraphicsBuffer!
+		}
+
+		ReuploadInstanceGraphicsBuffer();
+		// Dispose of GraphicsBuffer?
+	}
+	
 	[BurstCompile]
-	public unsafe JobHandle OnPerformCulling (
+	unsafe JobHandle OnPerformCulling (
 			BatchRendererGroup rendererGroup,
 			BatchCullingContext cullingContext,
 			BatchCullingOutput cullingOutput,
@@ -178,7 +225,7 @@ public class CustomEntityRenderer : MonoBehaviour {
 		if (NumInstances <= 0)
 			return new JobHandle();
 		
-		Debug.Log($"CustomEntityRenderer.OnPerformCulling() NumInstances: {NumInstances}");
+		//Debug.Log($"CustomEntityRenderer.OnPerformCulling() NumInstances: {NumInstances}");
 
 		perfCmd.Begin();
 
@@ -189,14 +236,15 @@ public class CustomEntityRenderer : MonoBehaviour {
 		var cmds_out = (BatchCullingOutputDrawCommands*)cullingOutput.drawCommands.GetUnsafePtr();
 		var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>(), alignment, Allocator.TempJob);
 		var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>()  , alignment, Allocator.TempJob);
-		var visible_instances   = (int*)UnsafeUtility.Malloc(NumInstances * sizeof(int)              , alignment, Allocator.TempJob);
+		
+		var visibleInstances = (int*)UnsafeUtility.Malloc(NumInstances * sizeof(int), UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 
 		// Acquire a pointer to the BatchCullingOutputDrawCommands struct so you can easily
 		// modify it directly.
 		cmds_out[0] = new BatchCullingOutputDrawCommands {
 			drawCommands     = cmds,
 			drawRanges       = ranges,
-			visibleInstances = visible_instances,
+			visibleInstances = visibleInstances,
 			drawCommandPickingInstanceIDs = null,
 
 			drawCommandCount = 1,
@@ -236,56 +284,62 @@ public class CustomEntityRenderer : MonoBehaviour {
 			},
 		};
 
-		// Finally, write the actual visible instance indices to the array. In a more complicated
-		// implementation, this output would depend on what is visible, but this example
-		// assumes that everything is visible.
-		for (int i = 0; i < NumInstances; ++i)
-			visible_instances[i] = i;
+		//// Finally, write the actual visible instance indices to the array. In a more complicated
+		//// implementation, this output would depend on what is visible, but this example
+		//// assumes that everything is visible.
+		//for (int i = 0; i < NumInstances; ++i)
+		//	visible_instances[i] = i;
+
+		var cullJob = new CullEntityInstancesJob {
+			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
+			ChunkBaseEntityIndices = entityIndices,
+			visibleInstances = visibleInstances,
+		}.ScheduleParallel(query, cullJobDep);
 
 		perfCmd.End();
-		return new JobHandle();
+		return cullJob;
 	}
-}
-
-[UpdateInGroup(typeof(PresentationSystemGroup))]
-partial struct ComputeEntityInstancesSystem : ISystem {
-	CustomEntityRenderer renderer => CustomEntityRenderer.inst;
-	EntityQuery query;
-
-	public void OnCreate (ref SystemState state) {
-		//Debug.Log("ComputeEntityInstancesSystem.OnCreate");
-		query = state.EntityManager.CreateEntityQuery(typeof(CustomRenderAsset), typeof(LocalTransform));
-	}
-
-	public void OnUpdate (ref SystemState state) {
-		int NumInstances = query.CalculateEntityCount();
-
-		Debug.Log($"ComputeEntityInstancesSystem.OnUpdate NumInstances: {NumInstances}");
-
-		var instanceBuf = renderer.ReallocateInstances(NumInstances);
-
-		if (NumInstances > 0) {
-			var job = new ComputeEntityInstancesJob{ instanceBuf = instanceBuf }
-				.ScheduleParallel(query, state.Dependency);
-			
-			job.Complete();
-		}
-
-		renderer.ReuploadInstanceGraphicsBuffer();
-	}
-
+	
 	[BurstCompile]
-	unsafe partial struct ComputeEntityInstancesJob : IJobEntity {
+	unsafe partial struct ComputeInstanceDataJob : IJobEntity {
 		[NativeDisableUnsafePtrRestriction]
-		public CustomEntityRenderer.InstanceDataBuffer instanceBuf;
-
+		public InstanceDataBuffer instanceData;
+		
+		[BurstCompile]
 		unsafe void Execute ([EntityIndexInQuery] int idx, in LocalTransform transform) {
-			instanceBuf.obj2world[idx] = CustomEntityRenderer.pack_matrix(transform.ToMatrix());
-			instanceBuf.world2obj[idx] = CustomEntityRenderer.pack_matrix(transform.ToInverseMatrix());
-			instanceBuf.color[idx] = (idx & 2) == 0 ? float4(1,0,0,1) : float4(0,1,0,1);
+			instanceData.obj2world[idx] = pack_matrix(transform.ToMatrix());
+			instanceData.world2obj[idx] = pack_matrix(transform.ToInverseMatrix());
+			instanceData.color[idx] = (idx & 2) == 0 ? float4(1,0,0,1) : float4(0,1,0,1);
+		}
+	}
+	
+	[BurstCompile]
+	unsafe partial struct CullEntityInstancesJob : IJobChunk {
+		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransformHandle;
+		//[ReadOnly] public SharedComponentTypeHandle<CustomRenderAsset> CustomRenderAssetHandle;
+
+		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
+
+		[NativeDisableUnsafePtrRestriction]
+		public int* visibleInstances;
+
+		[BurstCompile]
+		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 enabledMaskIn) {
+			Assert.IsFalse(useEnabledMask);
+
+			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransformHandle);
+			//var assetIdx = chunk.GetSharedComponentIndex(CustomRenderAssetHandle);
+
+			var baseEntityIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
+
+			for (int i=0; i<chunk.Count; i++) {
+				int idx = baseEntityIdx + i;
+				visibleInstances[idx] = idx;
+			}
 		}
 	}
 }
+
 
 public struct CustomRenderAsset : ISharedComponentData, IEquatable<CustomRenderAsset> {
 	public UnityObjectRef<Mesh> Mesh;
