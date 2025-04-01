@@ -20,14 +20,19 @@ using Unity.Profiling;
 using Unity.Burst.Intrinsics;
 using Unity.Assertions;
 using FrustumPlanes = Unity.Rendering.FrustumPlanes;
-using static Unity.Rendering.FrustumPlanes;
 
 public class CustomEntityRenderer : MonoBehaviour {
 	public Mesh mesh;
 	public Material material;
 
-	public float3 test_plane_pos = float3(20, 0, 0);
-	public float test_plane_ang = 20;
+#if UNITY_EDITOR
+	public static CustomEntityRenderer inst;
+	public CustomRendering.VisCulling dbg = new();
+
+	void LateUpdate () {
+		dbg.Draw();
+	}
+#endif
 
 	void OnValidate () {
 		refresh();
@@ -38,8 +43,9 @@ public class CustomEntityRenderer : MonoBehaviour {
 	}
 
 	void refresh () {
-		var p = new Plane(Quaternion.Euler(0,0,test_plane_ang) * Vector3.right, test_plane_pos);
-		float4 plane = float4(p.normal, p.distance);
+#if UNITY_EDITOR
+		inst = this;
+#endif
 
 		var world = World.DefaultGameObjectInjectionWorld;
 		var sys = world?.GetExistingSystem<CustomEntityRendererSystem>();
@@ -47,37 +53,10 @@ public class CustomEntityRenderer : MonoBehaviour {
 			world.EntityManager.SetComponentData(sys.Value, new CustomEntityRendererSystem.Input {
 				mesh = mesh,
 				material = material,
-				test_plane = plane,
 			});
 		}
 	}
-
-	//private void OnDrawGizmos () {
-	//	var world = World.DefaultGameObjectInjectionWorld;
-	//	var sys = world?.GetExistingSystem<CustomEntityRendererSystem>();
-	//	if (sys.HasValue && sys != SystemHandle.Null) {
-	//		var ctx = world.EntityManager.GetComponentData<CustomEntityRendererSystem.Input>(sys.Value).cull_ctx;
-	//
-	//		Gizmos.color = Color.green;
-	//	
-	//		foreach (var split in ctx.cullingSplits) {
-	//			var a = ctx.cullingPlanes[split.cullingPlaneOffset];
-	//			for (int i = split.cullingPlaneOffset; i < split.cullingPlaneOffset + split.cullingPlaneCount; i++) {
-	//				var b = ctx.cullingPlanes[i];
-	//			
-	//				Gizmos.DrawRay(ctx.lodParameters.cameraPosition, normalize(b.normal) * 10);
-	//
-	//				//if (GetPlaneIntersectionLine(a, b, out var point, out var dir)) {
-	//				//	point = ctx.localToWorldMatrix.MultiplyPoint(point);
-	//				//	dir = ctx.localToWorldMatrix.MultiplyVector(dir);
-	//				//	Debug.DrawLine(point, normalize(dir) * 10, Color.red);
-	//				//}
-	//			}
-	//		}
-	//	}
-	//}
 }
-
 [UpdateInGroup(typeof(PresentationSystemGroup))]
 [UpdateBefore(typeof(UpdatePresentationSystemGroup))]
 [BurstCompile]
@@ -86,9 +65,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	public class Input : IComponentData {
 		public Mesh mesh;
 		public Material material;
-		public float4 test_plane;
-
-		//public BatchCullingContext cull_ctx;
 	}
 
 	BatchRendererGroup brg = null;
@@ -102,9 +78,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	EntityQuery query; // all renderable entities
 
 	public unsafe struct InstanceDataBuffer {
-		//public NativeSlice<float3x4> obj2world;
-		//public NativeSlice<float3x4> world2obj;
-		//public NativeSlice<float4> color;
 		// Pointers into instanceGraphicsBuffer which is locked for writing
 		public float3x4* obj2world;
 		public float3x4* world2obj;
@@ -205,11 +178,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 				obj2world = (float3x4*)(ptr + offs0),
 				world2obj = (float3x4*)(ptr + offs1),
 				color = (float4*)(ptr + offs2),
-
-				// These should be safer to use, but I get weird errors trying to pass them to jobs
-				//obj2world = NativeSliceUnsafeUtility.ConvertExistingDataToNativeSlice<float3x4>(ptr + offs0, sizeof(float3x4), NumInstances),
-				//world2obj = NativeSliceUnsafeUtility.ConvertExistingDataToNativeSlice<float3x4>(ptr + offs1, sizeof(float3x4), NumInstances),
-				//color     = NativeSliceUnsafeUtility.ConvertExistingDataToNativeSlice<float4  >(ptr + offs2, sizeof(float4  ), NumInstances),
 			};
 
 			metadata = new NativeArray<MetadataValue>(3, Allocator.Temp);
@@ -227,22 +195,18 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		Remove(ref batchID);
 
 		if (NumInstances > 0) {
-			//instanceGraphicsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.LockBufferForWrite,
-			//	instanceBuf.raw.Length/sizeof(int), sizeof(int));
-			//instanceGraphicsBuffer.SetData(instanceBuf.raw);
 			instanceGraphicsBuffer.UnlockBufferAfterWrite<int>(instanceGraphicsBuffer.count);
 		
 			batchID = brg.AddBatch(metadata, instanceGraphicsBuffer.bufferHandle);
 		}
 
-		//instanceBuf.raw.Dispose();
 		perfUpload.End();
 	}
 	
 	protected override void OnUpdate () {
 		NumInstances = query.CalculateEntityCount();
 
-		Debug.Log($"CustomEntityRendererSystem.OnUpdate {NumInstances}");
+		//Debug.Log($"CustomEntityRendererSystem.OnUpdate {NumInstances}");
 		
 		ReallocateInstances();
 
@@ -259,75 +223,17 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		// Dispose of GraphicsBuffer?
 	}
 	
-	void DebugCulling (BatchCullingContext ctx) {
-		if (ctx.viewType == BatchCullingViewType.Camera) return;
-		
-		//var val = World.EntityManager.GetComponentData<Input>(SystemHandle);
-		//val.cull_ctx = ctx;
-		//World.EntityManager.SetComponentData(SystemHandle, val);
-
-		
-		for (int s = 0; s < ctx.cullingSplits.Length; s++) {
-			if (s != 0) continue;
-			var split = ctx.cullingSplits[s];
-
-			for (int i = split.cullingPlaneOffset; i < split.cullingPlaneOffset + split.cullingPlaneCount; i++) {
-				var a = ctx.cullingPlanes[split.cullingPlaneOffset];
-				for (int j = split.cullingPlaneOffset; j < split.cullingPlaneOffset + split.cullingPlaneCount; j++) {
-					var b = ctx.cullingPlanes[j];
-				
-					//Debug.DrawRay(ctx.lodParameters.cameraPosition, normalize(b.normal) * 10, Color.red);
-					//Debug.DrawRay(float3(0), normalize(b.normal) * 10, Color.red);
-
-					if (GetPlaneIntersectionLine(a, b, out var point, out var dir)) {
-						point = ctx.localToWorldMatrix.MultiplyPoint(point);
-						dir = ctx.localToWorldMatrix.MultiplyVector(dir);
-						Debug.DrawRay(point, normalize(dir) * 10, Color.red);
-					}
-				}
-			}
-		}
-	}
-
-	public static bool GetPlaneIntersectionLine (Plane plane1, Plane plane2, out Vector3 linePoint, out Vector3 lineDirection) {
-		// Cross product of the normals gives the direction of the intersection line
-		lineDirection = Vector3.Cross(plane1.normal, plane2.normal);
-
-		// Check if the planes are parallel (no intersection or they are the same plane)
-		if (lineDirection.sqrMagnitude < Mathf.Epsilon) {
-			linePoint = Vector3.zero;
-			return false; // Planes are parallel
-		}
-
-		// Find a point on the intersection line
-		Vector3 pointOnPlane1 = plane1.normal * -plane1.distance;
-		Vector3 pointOnPlane2 = plane2.normal * -plane2.distance;
-
-		// Solve for a point on the line using the plane equations
-		Vector3 directionCross = Vector3.Cross(lineDirection, plane2.normal);
-		float determinant = Vector3.Dot(plane1.normal, directionCross);
-
-		if (Mathf.Abs(determinant) > Mathf.Epsilon) // Ensure determinant is not zero
-		{
-			Vector3 diff = pointOnPlane2 - pointOnPlane1;
-			float t = Vector3.Dot(diff, directionCross) / determinant;
-			linePoint = pointOnPlane1 + t * plane1.normal;
-			return true;
-		}
-
-		linePoint = Vector3.zero;
-		return false;
-	}
-
 	[BurstCompile]
 	unsafe JobHandle OnPerformCulling (
 			BatchRendererGroup rendererGroup,
 			BatchCullingContext cullingContext,
 			BatchCullingOutput cullingOutput,
 			IntPtr userContext) {
-		//Debug.Log("CustomEntityRenderer.OnPerformCulling");
+		//Debug.Log($"CustomEntityRenderer.OnPerformCulling {cullingContext.viewType}");
 		
-		//DebugCulling(cullingContext);
+	#if UNITY_EDITOR
+		CustomEntityRenderer.inst.dbg.OnCulling(ref cullingContext);
+	#endif
 
 		if (NumInstances <= 0)
 			return new JobHandle();
@@ -336,28 +242,26 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		perfCmd.Begin();
 
-		// UnsafeUtility.Malloc() requires an alignment, so use the largest integer type's alignment
-		// which is a reasonable default.
-		int alignment = UnsafeUtility.AlignOf<long>();
-		
 		var cmds_out = (BatchCullingOutputDrawCommands*)cullingOutput.drawCommands.GetUnsafePtr();
-		var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>(), alignment, Allocator.TempJob);
-		var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>()  , alignment, Allocator.TempJob);
+		// These are supposedly auto-freed by the batch renderer
+		var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>(), UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
+		var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>()  , UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 		
 		var visibleInstances = new UnsafeList<int>(NumInstances, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
 		
-		//var cullingSplits = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
+		// Reuse Unity Culling Utils
+		var cullingData = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
 		
-		var test_plane = SystemAPI.ManagedAPI.GetComponent<Input>(SystemHandle).test_plane;
-
 		var cullJob = new CullEntityInstancesJob {
-			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
 			ChunkBaseEntityIndices = entityIndices,
-			//cullingSplits = cullingSplits,
-			plane = test_plane,
+			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
 			visibleInstances = visibleInstances.AsParallelWriter(),
+			CullingData = cullingData,
+			CullingViewType = cullingContext.viewType,
 		}.ScheduleParallel(query, cullJobDep);
 
+		// Need to somehow have visibleInstances.Length be finalized before outputting BatchCullingOutputDrawCommands
+		// TODO: How does Entities.Graphics solve this? Maybe we simply use a reference to BatchCullingOutputDrawCommands and update this from jobs?
 		cullJob.Complete();
 
 		cmds_out[0] = new BatchCullingOutputDrawCommands {
@@ -376,13 +280,12 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		cmds[0] = new BatchDrawCommand {
 			visibleOffset = 0,
-			//visibleCount = (uint)NumInstances,
 			visibleCount = (uint)visibleInstances.Length,
 			batchID = batchID,
 			materialID = materialID,
 			meshID = meshID,
 			submeshIndex = 0,
-			splitVisibilityMask = 0xff,
+			splitVisibilityMask = 0xff, // TODO: Currently rendering in all shadow cascades!
 			flags = 0,
 			sortingPosition = 0,
 		};
@@ -397,9 +300,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 				shadowCastingMode = ShadowCastingMode.On // Should I not get this from the material? How?
 			},
 		};
-
-		//for (int i = 0; i < NumInstances; ++i)
-		//	visible_instances[i] = i;
 
 		perfCmd.End();
 		//return cullJob;
@@ -416,68 +316,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			instanceData.obj2world[idx] = pack_matrix(transform.ToMatrix());
 			instanceData.world2obj[idx] = pack_matrix(transform.ToInverseMatrix());
 			instanceData.color[idx] = (idx & 2) == 0 ? float4(1,0,0,1) : float4(0,1,0,1);
-		}
-	}
-	
-	[BurstCompile]
-	unsafe partial struct CullEntityInstancesJob : IJobChunk {
-		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransformHandle;
-		//[ReadOnly] public SharedComponentTypeHandle<CustomRenderAsset> CustomRenderAssetHandle;
-
-		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
-
-		//[ReadOnly] public CustomRendering.CullingSplits cullingSplits;
-		[ReadOnly] public float4 plane;
-
-		public UnsafeList<int>.ParallelWriter visibleInstances;
-
-		[BurstCompile]
-		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 enabledMaskIn) {
-			Assert.IsFalse(useEnabledMask);
-
-			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransformHandle);
-			//var assetIdx = chunk.GetSharedComponentIndex(CustomRenderAssetHandle);
-
-			var baseEntityIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
-
-			int* visibleIdxs = stackalloc int[128];
-			int visibleCount = 0;
-
-			for (int i=0; i<chunk.Count; i++) {
-				int idx = baseEntityIdx + i;
-
-				var pos = transforms[i];
-
-				AABB aabb = new AABB { Center = pos.Position, Extents = 1 };
-
-				//bool visible = FrustumPlanes.Intersect2(cullingSplits.SplitPlanePackets.AsNativeArray(), aabb) != FrustumPlanes.IntersectResult.Out;
-				bool visible = Intersect(plane, aabb) != IntersectResult.Out;
-
-				if (visible)
-					visibleIdxs[visibleCount++] = idx;
-			}
-
-			if (visibleCount > 0)
-				visibleInstances.AddRangeNoResize(visibleIdxs, visibleCount);
-		}
-
-		public static IntersectResult Intersect (float4 cullingPlane, AABB a) {
-			float3 m = a.Center;
-			float3 extent = a.Extents;
-
-			var inCount = 0;
-			for (int i = 0; i < 1; i++) {
-				float3 normal = cullingPlane.xyz;
-				float dist = math.dot(normal, m) + cullingPlane.w;
-				float radius = math.dot(extent, math.abs(normal));
-				if (dist + radius <= 0)
-					return IntersectResult.Out;
-
-				if (dist > radius)
-					inCount++;
-			}
-
-			return (inCount == 1) ? IntersectResult.In : IntersectResult.Partial;
 		}
 	}
 }

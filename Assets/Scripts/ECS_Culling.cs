@@ -22,45 +22,89 @@ using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
+using static Unity.Mathematics.math;
 
 using FrustumPlanes = Unity.Rendering.FrustumPlanes;
+using System.Collections.Generic;
+using System;
+using Unity.Transforms;
 
+// Derived from Unity Entity Graphics rather than reused because it was internal
 
-/*
- * Batch-oriented culling.
- *
- * This culling approach oriented from Megacity and works well for relatively
- * slow-moving cameras in a large, dense environment.
- *
- * The primary CPU costs involved in culling all the chunks of mesh instances
- * in megacity is touching the chunks of memory. A naive culling approach would
- * look like this:
- *
- *     for each chunk:
- *       select what instances should be enabled based on camera position (lod selection)
- *
- *     for each frustum:
- *       for each chunk:
- *         if the chunk is completely out of the frustum:
- *           discard
- *         else:
- *           for each instance in the chunk:
- *             if the instance is inside the frustum:
- *               write index of instance to output index buffer
- *
- * The approach implemented here does essentially this, but has been optimized
- * so that chunks need to be accessed as infrequently as possible:
- *
- * - Because the chunks are static, we can cache bounds information outside the chunks
- *
- * - Because the camera moves relatively slowly, we can compute a grace
- *   distance which the camera has to move (in any direction) before the LOD
- *   selection would compute a different result
- *
- * - Because only a some chunks straddle the frustum boundaries, we can treat
- *   them as "in" rather than "partial" to save touching their chunk memory
- */
+[BurstCompile]
+unsafe partial struct CullEntityInstancesJob : IJobChunk {
+	[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
+	[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransformHandle;
+	//[ReadOnly] public SharedComponentTypeHandle<CustomRenderAsset> CustomRenderAssetHandle;
 
+	[ReadOnly] public CustomRendering.CullingSplits CullingData;
+	[ReadOnly] public BatchCullingViewType CullingViewType;
+
+	public UnsafeList<int>.ParallelWriter visibleInstances;
+
+	struct ChunkVisiblityFlags {
+		public fixed byte EntityVisible[128];
+	}
+	struct ChunkVisiblity {
+		public fixed int EntityIndexes[128]; // Instance IDs for drawcalls later
+		public int EntityCount;
+	}
+
+	[BurstCompile]
+	public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 enabledMaskIn) {
+		Assert.IsFalse(useEnabledMask);
+
+		NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransformHandle);
+		//var assetIdx = chunk.GetSharedComponentIndex(CustomRenderAssetHandle);
+
+		var baseEntityIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
+
+		ChunkVisiblity visible;
+		visible.EntityCount = 0;
+
+		if (CullingViewType == BatchCullingViewType.Light) {
+			ref var splits = ref CullingData.Splits;
+				
+			ChunkVisiblityFlags vis;
+
+			// First, perform frustum and receiver plane culling for all splits
+			for (int splitIndex = 0; splitIndex < splits.Length; ++splitIndex) {
+				var split = splits[splitIndex];
+				byte splitMask = (byte)(1 << splitIndex);
+
+				var splitPlanes = CullingData.SplitPlanePackets.GetSubNativeArray(split.PlanePacketOffset, split.PlanePacketCount);
+
+				for (int i=0; i<chunk.Count; i++) {
+					AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
+
+					bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
+					vis.EntityVisible[i] |= isVisible ? (byte)1 : (byte)0;
+				}
+			}
+			
+			for (int i=0; i<chunk.Count; i++) {
+				if (vis.EntityVisible[i] != 0)
+					visible.EntityIndexes[visible.EntityCount++] = baseEntityIdx + i;
+			}
+		}
+		else {
+			Assert.IsTrue(CullingData.Splits.Length == 1);
+
+			var splitPlanes = CullingData.SplitPlanePackets.AsNativeArray();
+
+			for (int i=0; i<chunk.Count; i++) {
+				AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
+
+				bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
+				if (isVisible)
+					visible.EntityIndexes[visible.EntityCount++] = baseEntityIdx + i;
+			}
+		}
+
+		if (visible.EntityCount > 0)
+			visibleInstances.AddRangeNoResize(visible.EntityIndexes, visible.EntityCount);
+	}
+}
 
 public static class CullingExtensions {
 	// We want to use UnsafeList to use RewindableAllocator, but PlanePacket APIs want NativeArrays
@@ -130,6 +174,105 @@ public static class CullingExtensions {
 }
 
 namespace CustomRendering {
+	
+#if UNITY_EDITOR
+	// Fun Visualization of Culling of Game view camera in Scene view, not safe at all!
+	[System.Serializable]
+	public class VisCulling {
+		// Copy NativeArray data since it is only valid this frame
+		static BatchCullingContext CopyCullingData (in BatchCullingContext ctx) {
+			// Gnarly and not safe at all!
+			var planes = new NativeArray<Plane>(ctx.cullingPlanes.ToArray(), Allocator.TempJob);
+			var splits = new NativeArray<CullingSplit>(ctx.cullingSplits.ToArray(), Allocator.TempJob);
+			IntPtr occlusionBuffer = IntPtr.Zero;
+			
+			var viewID = (ulong)ctx.viewID.GetType().GetField("handle", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.GetValue(ctx.viewID);
+
+			var ctors = ctx.GetType().GetConstructors(System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+			return (BatchCullingContext)ctors[0].Invoke(new object[] { planes, splits, ctx.lodParameters, ctx.localToWorldMatrix,
+					ctx.viewType, ctx.projectionType, ctx.cullingFlags, viewID, ctx.cullingLayerMask, ctx.sceneCullingMask,
+					(byte)ctx.splitExclusionMask, ctx.receiverPlaneOffset, ctx.receiverPlaneCount, occlusionBuffer });
+		}
+
+		List<BatchCullingContext> culling = new();
+		public BatchCullingContext prevCameraCulling { get; private set; }
+
+		public bool VisualizePlanes = true;
+		public bool VisualizeCullingInScene = true;
+
+		public int SceneCamIndex = 0;
+		public BatchCullingViewType ShowType = BatchCullingViewType.Light;
+		public int ShowSplit = 0;
+
+		public void Draw () {
+			foreach (var ctx in culling) {
+				DebugCulling(ctx);
+			}
+			culling.Clear();
+			counter = 0;
+		}
+
+		int counter = 0;
+
+		public void OnCulling (ref BatchCullingContext ctx) {
+			int idx = counter++;
+			if (idx/2 == SceneCamIndex) {
+				// Don't show scene camera culling
+				if (VisualizeCullingInScene && ctx.viewType == BatchCullingViewType.Camera)
+					ctx = prevCameraCulling;
+			}
+			else {
+				var data = CopyCullingData(ctx);
+
+				culling.Add(data);
+
+				if (ctx.viewType == BatchCullingViewType.Camera)
+					prevCameraCulling = data;
+			}
+		}
+
+		static void DebugDrawPlane (float3 cam_pos, Plane plane, float width, int count, Color col) {
+			float3 normal = normalize(plane.normal);
+
+			float3 up = float3(0,1,0);
+			float3 forw = cross(up, normal);
+	
+			up = normalize(cross(normal, forw));
+			forw = normalize(forw);
+
+			float3 pos = plane.ClosestPointOnPlane(cam_pos);
+
+			for (int i=0; i<=count; i++) {
+				float3 x = forw * lerp(-width, width, i / (float)count);
+				Debug.DrawLine(
+					pos - up * width + x,
+					pos + up * width + x,
+					col);
+			}
+			for (int i=0; i<=count; i++) {
+				float3 x = up * lerp(-width, width, i / (float)count);
+				Debug.DrawLine(
+					pos - forw * width + x,
+					pos + forw * width + x,
+					col);
+			}
+		}
+	
+		void DebugCulling (in BatchCullingContext ctx) {
+			if (VisualizePlanes && ctx.viewType == ShowType) {
+		
+				for (int s = 0; s < ctx.cullingSplits.Length; s++) {
+					if (s != ShowSplit) continue;
+					var split = ctx.cullingSplits[s];
+
+					for (int i = split.cullingPlaneOffset; i < split.cullingPlaneOffset + split.cullingPlaneCount; i++) {
+						DebugDrawPlane(ctx.lodParameters.cameraPosition, ctx.cullingPlanes[i], 10, 10, Color.grey);
+					}
+				}
+			}
+		}
+	}
+#endif
 
 	internal unsafe struct CullingSplits {
 		public UnsafeList<Plane> BackfacingReceiverPlanes;
@@ -488,8 +631,8 @@ namespace CustomRendering {
 			LSReceiverSphereCenterX4 = new float4(float.PositiveInfinity);
 			LSReceiverSphereCenterY4 = new float4(float.PositiveInfinity);
 			LSReceiverSphereCenterZ4 = new float4(float.PositiveInfinity);
-			ReceiverSphereRadius4 = float4.zero;
-			CoreSphereRadius4 = float4.zero;
+			ReceiverSphereRadius4 = 0;
+			CoreSphereRadius4 = 0;
 
 			LightAxisX = new float4(cullingContext.localToWorldMatrix.GetColumn(0)).xyz;
 			LightAxisY = new float4(cullingContext.localToWorldMatrix.GetColumn(1)).xyz;

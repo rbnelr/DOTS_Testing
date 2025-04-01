@@ -6593,6 +6593,10 @@ MonoBehaviour:
     y: 40
     z: 0
   test_plane_ang: 20
+  dbg:
+    SceneCamIndex: 0
+    ShowType: 1
+    ShowSplit: 0
 --- !u!4 &1777464960
 Transform:
   m_ObjectHideFlags: 0
