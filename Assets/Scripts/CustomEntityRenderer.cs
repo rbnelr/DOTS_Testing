@@ -19,31 +19,76 @@ using Unity.Transforms;
 using Unity.Profiling;
 using Unity.Burst.Intrinsics;
 using Unity.Assertions;
+using FrustumPlanes = Unity.Rendering.FrustumPlanes;
+using static Unity.Rendering.FrustumPlanes;
 
 public class CustomEntityRenderer : MonoBehaviour {
 	public Mesh mesh;
 	public Material material;
 
+	public float3 test_plane_pos = float3(20, 0, 0);
+	public float test_plane_ang = 20;
+
 	void OnValidate () {
+		refresh();
+	}
+
+	void Start () {
+		refresh();
+	}
+
+	void refresh () {
+		var p = new Plane(Quaternion.Euler(0,0,test_plane_ang) * Vector3.right, test_plane_pos);
+		float4 plane = float4(p.normal, p.distance);
+
 		var world = World.DefaultGameObjectInjectionWorld;
 		var sys = world?.GetExistingSystem<CustomEntityRendererSystem>();
 		if (sys.HasValue && sys != SystemHandle.Null) {
 			world.EntityManager.SetComponentData(sys.Value, new CustomEntityRendererSystem.Input {
 				mesh = mesh,
 				material = material,
+				test_plane = plane,
 			});
 		}
 	}
+
+	//private void OnDrawGizmos () {
+	//	var world = World.DefaultGameObjectInjectionWorld;
+	//	var sys = world?.GetExistingSystem<CustomEntityRendererSystem>();
+	//	if (sys.HasValue && sys != SystemHandle.Null) {
+	//		var ctx = world.EntityManager.GetComponentData<CustomEntityRendererSystem.Input>(sys.Value).cull_ctx;
+	//
+	//		Gizmos.color = Color.green;
+	//	
+	//		foreach (var split in ctx.cullingSplits) {
+	//			var a = ctx.cullingPlanes[split.cullingPlaneOffset];
+	//			for (int i = split.cullingPlaneOffset; i < split.cullingPlaneOffset + split.cullingPlaneCount; i++) {
+	//				var b = ctx.cullingPlanes[i];
+	//			
+	//				Gizmos.DrawRay(ctx.lodParameters.cameraPosition, normalize(b.normal) * 10);
+	//
+	//				//if (GetPlaneIntersectionLine(a, b, out var point, out var dir)) {
+	//				//	point = ctx.localToWorldMatrix.MultiplyPoint(point);
+	//				//	dir = ctx.localToWorldMatrix.MultiplyVector(dir);
+	//				//	Debug.DrawLine(point, normalize(dir) * 10, Color.red);
+	//				//}
+	//			}
+	//		}
+	//	}
+	//}
 }
 
-//[BurstCompile]
 [UpdateInGroup(typeof(PresentationSystemGroup))]
-[UpdateAfter(typeof(UpdatePresentationSystemGroup))]
+[UpdateBefore(typeof(UpdatePresentationSystemGroup))]
+[BurstCompile]
 public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	
 	public class Input : IComponentData {
 		public Mesh mesh;
 		public Material material;
+		public float4 test_plane;
+
+		//public BatchCullingContext cull_ctx;
 	}
 
 	BatchRendererGroup brg = null;
@@ -170,7 +215,7 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			metadata = new NativeArray<MetadataValue>(3, Allocator.Temp);
 			metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)offs0 };
 			metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)offs1 };
-			metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("_BaseColor"), Value = 0x80000000 | (uint)offs2 };
+			metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("_BaseColor"         ), Value = 0x80000000 | (uint)offs2 };
 		}
 
 		perfAlloc.End();
@@ -197,7 +242,7 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	protected override void OnUpdate () {
 		NumInstances = query.CalculateEntityCount();
 
-		//Debug.Log($"CustomEntityRendererSystem.OnUpdate {NumInstances}");
+		Debug.Log($"CustomEntityRendererSystem.OnUpdate {NumInstances}");
 		
 		ReallocateInstances();
 
@@ -214,6 +259,66 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		// Dispose of GraphicsBuffer?
 	}
 	
+	void DebugCulling (BatchCullingContext ctx) {
+		if (ctx.viewType == BatchCullingViewType.Camera) return;
+		
+		//var val = World.EntityManager.GetComponentData<Input>(SystemHandle);
+		//val.cull_ctx = ctx;
+		//World.EntityManager.SetComponentData(SystemHandle, val);
+
+		
+		for (int s = 0; s < ctx.cullingSplits.Length; s++) {
+			if (s != 0) continue;
+			var split = ctx.cullingSplits[s];
+
+			for (int i = split.cullingPlaneOffset; i < split.cullingPlaneOffset + split.cullingPlaneCount; i++) {
+				var a = ctx.cullingPlanes[split.cullingPlaneOffset];
+				for (int j = split.cullingPlaneOffset; j < split.cullingPlaneOffset + split.cullingPlaneCount; j++) {
+					var b = ctx.cullingPlanes[j];
+				
+					//Debug.DrawRay(ctx.lodParameters.cameraPosition, normalize(b.normal) * 10, Color.red);
+					//Debug.DrawRay(float3(0), normalize(b.normal) * 10, Color.red);
+
+					if (GetPlaneIntersectionLine(a, b, out var point, out var dir)) {
+						point = ctx.localToWorldMatrix.MultiplyPoint(point);
+						dir = ctx.localToWorldMatrix.MultiplyVector(dir);
+						Debug.DrawRay(point, normalize(dir) * 10, Color.red);
+					}
+				}
+			}
+		}
+	}
+
+	public static bool GetPlaneIntersectionLine (Plane plane1, Plane plane2, out Vector3 linePoint, out Vector3 lineDirection) {
+		// Cross product of the normals gives the direction of the intersection line
+		lineDirection = Vector3.Cross(plane1.normal, plane2.normal);
+
+		// Check if the planes are parallel (no intersection or they are the same plane)
+		if (lineDirection.sqrMagnitude < Mathf.Epsilon) {
+			linePoint = Vector3.zero;
+			return false; // Planes are parallel
+		}
+
+		// Find a point on the intersection line
+		Vector3 pointOnPlane1 = plane1.normal * -plane1.distance;
+		Vector3 pointOnPlane2 = plane2.normal * -plane2.distance;
+
+		// Solve for a point on the line using the plane equations
+		Vector3 directionCross = Vector3.Cross(lineDirection, plane2.normal);
+		float determinant = Vector3.Dot(plane1.normal, directionCross);
+
+		if (Mathf.Abs(determinant) > Mathf.Epsilon) // Ensure determinant is not zero
+		{
+			Vector3 diff = pointOnPlane2 - pointOnPlane1;
+			float t = Vector3.Dot(diff, directionCross) / determinant;
+			linePoint = pointOnPlane1 + t * plane1.normal;
+			return true;
+		}
+
+		linePoint = Vector3.zero;
+		return false;
+	}
+
 	[BurstCompile]
 	unsafe JobHandle OnPerformCulling (
 			BatchRendererGroup rendererGroup,
@@ -222,6 +327,8 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			IntPtr userContext) {
 		//Debug.Log("CustomEntityRenderer.OnPerformCulling");
 		
+		//DebugCulling(cullingContext);
+
 		if (NumInstances <= 0)
 			return new JobHandle();
 		
@@ -237,31 +344,40 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>(), alignment, Allocator.TempJob);
 		var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>()  , alignment, Allocator.TempJob);
 		
-		var visibleInstances = (int*)UnsafeUtility.Malloc(NumInstances * sizeof(int), UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
+		var visibleInstances = new UnsafeList<int>(NumInstances, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+		
+		//var cullingSplits = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
+		
+		var test_plane = SystemAPI.ManagedAPI.GetComponent<Input>(SystemHandle).test_plane;
 
-		// Acquire a pointer to the BatchCullingOutputDrawCommands struct so you can easily
-		// modify it directly.
+		var cullJob = new CullEntityInstancesJob {
+			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
+			ChunkBaseEntityIndices = entityIndices,
+			//cullingSplits = cullingSplits,
+			plane = test_plane,
+			visibleInstances = visibleInstances.AsParallelWriter(),
+		}.ScheduleParallel(query, cullJobDep);
+
+		cullJob.Complete();
+
 		cmds_out[0] = new BatchCullingOutputDrawCommands {
 			drawCommands     = cmds,
 			drawRanges       = ranges,
-			visibleInstances = visibleInstances,
+			visibleInstances = visibleInstances.Ptr, // Does this cause UnsafeList to be freed correctly?
 			drawCommandPickingInstanceIDs = null,
 
 			drawCommandCount = 1,
 			drawRangeCount = 1,
 			visibleInstanceCount = NumInstances,
 
-			// This example doens't use depth sorting, so it leaves instanceSortingPositions as null.
 			instanceSortingPositions = null,
 			instanceSortingPositionFloatCount = 0,
 		};
 
-		// Configure the single draw command to draw kNumInstances instances
-		// starting from offset 0 in the array, using the batch, material and mesh
-		// IDs registered in the Start() method. It doesn't set any special flags.
 		cmds[0] = new BatchDrawCommand {
 			visibleOffset = 0,
-			visibleCount = (uint)NumInstances,
+			//visibleCount = (uint)NumInstances,
+			visibleCount = (uint)visibleInstances.Length,
 			batchID = batchID,
 			materialID = materialID,
 			meshID = meshID,
@@ -271,8 +387,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			sortingPosition = 0,
 		};
 
-		// Configure the single draw range to cover the single draw command which
-		// is at offset 0.
 		ranges[0] = new BatchDrawRange {
 			drawCommandsType = BatchDrawCommandType.Direct,
 			drawCommandsBegin = 0,
@@ -284,20 +398,12 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			},
 		};
 
-		//// Finally, write the actual visible instance indices to the array. In a more complicated
-		//// implementation, this output would depend on what is visible, but this example
-		//// assumes that everything is visible.
 		//for (int i = 0; i < NumInstances; ++i)
 		//	visible_instances[i] = i;
 
-		var cullJob = new CullEntityInstancesJob {
-			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
-			ChunkBaseEntityIndices = entityIndices,
-			visibleInstances = visibleInstances,
-		}.ScheduleParallel(query, cullJobDep);
-
 		perfCmd.End();
-		return cullJob;
+		//return cullJob;
+		return new JobHandle();
 	}
 	
 	[BurstCompile]
@@ -320,8 +426,10 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
 
-		[NativeDisableUnsafePtrRestriction]
-		public int* visibleInstances;
+		//[ReadOnly] public CustomRendering.CullingSplits cullingSplits;
+		[ReadOnly] public float4 plane;
+
+		public UnsafeList<int>.ParallelWriter visibleInstances;
 
 		[BurstCompile]
 		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 enabledMaskIn) {
@@ -332,10 +440,44 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 			var baseEntityIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
 
+			int* visibleIdxs = stackalloc int[128];
+			int visibleCount = 0;
+
 			for (int i=0; i<chunk.Count; i++) {
 				int idx = baseEntityIdx + i;
-				visibleInstances[idx] = idx;
+
+				var pos = transforms[i];
+
+				AABB aabb = new AABB { Center = pos.Position, Extents = 1 };
+
+				//bool visible = FrustumPlanes.Intersect2(cullingSplits.SplitPlanePackets.AsNativeArray(), aabb) != FrustumPlanes.IntersectResult.Out;
+				bool visible = Intersect(plane, aabb) != IntersectResult.Out;
+
+				if (visible)
+					visibleIdxs[visibleCount++] = idx;
 			}
+
+			if (visibleCount > 0)
+				visibleInstances.AddRangeNoResize(visibleIdxs, visibleCount);
+		}
+
+		public static IntersectResult Intersect (float4 cullingPlane, AABB a) {
+			float3 m = a.Center;
+			float3 extent = a.Extents;
+
+			var inCount = 0;
+			for (int i = 0; i < 1; i++) {
+				float3 normal = cullingPlane.xyz;
+				float dist = math.dot(normal, m) + cullingPlane.w;
+				float radius = math.dot(extent, math.abs(normal));
+				if (dist + radius <= 0)
+					return IntersectResult.Out;
+
+				if (dist > radius)
+					inCount++;
+			}
+
+			return (inCount == 1) ? IntersectResult.In : IntersectResult.Partial;
 		}
 	}
 }

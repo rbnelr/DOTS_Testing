@@ -3462,7 +3462,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!4 &988065265
 Transform:
   m_ObjectHideFlags: 0
@@ -6588,6 +6588,11 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   mesh: {fileID: 7239313822713262110, guid: 096f76d56c223874485d6bd7dd75049f, type: 3}
   material: {fileID: 2100000, guid: b31f2515abcf0e041ac92c552d297a2f, type: 2}
+  test_plane_pos:
+    x: 50
+    y: 40
+    z: 0
+  test_plane_ang: 20
 --- !u!4 &1777464960
 Transform:
   m_ObjectHideFlags: 0
