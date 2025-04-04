@@ -32,6 +32,9 @@ public class CustomEntityRenderer : MonoBehaviour {
 	void LateUpdate () {
 		dbg.Draw();
 	}
+	void OnDisable () {
+		dbg.DisposeData();
+	}
 #endif
 
 	void OnValidate () {
@@ -57,6 +60,7 @@ public class CustomEntityRenderer : MonoBehaviour {
 		}
 	}
 }
+
 [UpdateInGroup(typeof(PresentationSystemGroup))]
 [UpdateBefore(typeof(UpdatePresentationSystemGroup))]
 [BurstCompile]
@@ -95,6 +99,8 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		var input = SystemAPI.ManagedAPI.GetComponent<Input>(SystemHandle);
 
+		// TODO: comment how BatchRendererGroup ends up getting called by the engine, ie how dows unity know to 'call' my system
+		// Probably new BatchRendererGroup registers itself with the engine
 		brg = new BatchRendererGroup(OnPerformCulling, IntPtr.Zero);
 		// Register meshes and Materials, in my use case these would be fixed and remain in VRAM
 		// but CustomEntityRenderer might observe asset managers for potential reloads
@@ -221,6 +227,8 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		ReuploadInstanceGraphicsBuffer();
 		// Dispose of GraphicsBuffer?
+
+		// TODO: defer instDataJob.Complete() + ReuploadInstanceGraphicsBuffer to OnPerformCulling because that runs potentially way later in the frame, and this we might hide wait
 	}
 	
 	[BurstCompile]
@@ -241,33 +249,43 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		//Debug.Log($"CustomEntityRenderer.OnPerformCulling() NumInstances: {NumInstances}");
 
 		perfCmd.Begin();
+		
+		var visibleInstancesCopy = (int*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<int>() * NumInstances, UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
+		int visibleCount;
+		{
+			var visibleInstances = new UnsafeList<int>(NumInstances, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+		
+			// Reuse Unity Culling Utils
+			var cullingData = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
+		
+			var cullJob = new CullEntityInstancesJob {
+				ChunkBaseEntityIndices = entityIndices,
+				LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
+				visibleInstances = visibleInstances.AsParallelWriter(),
+				CullingData = cullingData,
+				CullingViewType = cullingContext.viewType,
+			}.ScheduleParallel(query, cullJobDep);
 
+			// Need to somehow have visibleInstances.Length be finalized before outputting BatchCullingOutputDrawCommands
+			// TODO: How does Entities.Graphics solve this? Maybe we simply use a reference to BatchCullingOutputDrawCommands and update this from jobs?
+			cullJob.Complete();
+		
+			UnsafeUtility.MemCpy(visibleInstancesCopy, visibleInstances.Ptr, UnsafeUtility.SizeOf<int>() * NumInstances);
+			visibleCount = visibleInstances.Length;
+			visibleInstances.Dispose();
+		}
+
+	////
 		var cmds_out = (BatchCullingOutputDrawCommands*)cullingOutput.drawCommands.GetUnsafePtr();
 		// These are supposedly auto-freed by the batch renderer
 		var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>(), UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 		var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>()  , UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 		
-		var visibleInstances = new UnsafeList<int>(NumInstances, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-		
-		// Reuse Unity Culling Utils
-		var cullingData = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
-		
-		var cullJob = new CullEntityInstancesJob {
-			ChunkBaseEntityIndices = entityIndices,
-			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
-			visibleInstances = visibleInstances.AsParallelWriter(),
-			CullingData = cullingData,
-			CullingViewType = cullingContext.viewType,
-		}.ScheduleParallel(query, cullJobDep);
-
-		// Need to somehow have visibleInstances.Length be finalized before outputting BatchCullingOutputDrawCommands
-		// TODO: How does Entities.Graphics solve this? Maybe we simply use a reference to BatchCullingOutputDrawCommands and update this from jobs?
-		cullJob.Complete();
-
 		cmds_out[0] = new BatchCullingOutputDrawCommands {
 			drawCommands     = cmds,
 			drawRanges       = ranges,
-			visibleInstances = visibleInstances.Ptr, // Does this cause UnsafeList to be freed correctly?
+			//visibleInstances = visibleInstances.Ptr, // Does this cause UnsafeList to be freed correctly?
+			visibleInstances = visibleInstancesCopy, // Does this cause UnsafeList to be freed correctly?
 			drawCommandPickingInstanceIDs = null,
 
 			drawCommandCount = 1,
@@ -280,7 +298,8 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		cmds[0] = new BatchDrawCommand {
 			visibleOffset = 0,
-			visibleCount = (uint)visibleInstances.Length,
+			//visibleCount = (uint)visibleInstances.Length,
+			visibleCount = (uint)visibleCount,
 			batchID = batchID,
 			materialID = materialID,
 			meshID = meshID,

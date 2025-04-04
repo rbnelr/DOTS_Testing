@@ -3,7 +3,11 @@ using Unity.Mathematics;
 using static Unity.Mathematics.math;
 
 public class GO_Spawner : MonoBehaviour {
-	
+	public static GO_Spawner inst;
+	void Start () {
+		inst = this;
+	}
+
 	public GameObject prefab;
 
 	int Count = 0;
@@ -53,8 +57,6 @@ public class GO_Spawner : MonoBehaviour {
 			DestroyAll();
 			SpawnAll();
 		}
-
-		QualitySettings.lodBias = 2.0f * LODBias;
 	}
 
 	void OnDisable () {

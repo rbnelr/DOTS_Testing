@@ -195,7 +195,7 @@ namespace CustomRendering {
 		}
 
 		List<BatchCullingContext> culling = new();
-		public BatchCullingContext prevCameraCulling { get; private set; }
+		public BatchCullingContext? prevCameraCulling { get; private set; }
 
 		public bool VisualizePlanes = true;
 		public bool VisualizeCullingInScene = true;
@@ -208,8 +208,19 @@ namespace CustomRendering {
 			foreach (var ctx in culling) {
 				DebugCulling(ctx);
 			}
+			
+			DisposeData();
+		}
+		public void DisposeData () {
+			// Needs to be disposed
+			foreach (var ctx in culling) {
+				ctx.cullingPlanes.Dispose();
+				ctx.cullingSplits.Dispose();
+			}
 			culling.Clear();
 			counter = 0;
+			// Has been disposed already
+			prevCameraCulling = null;
 		}
 
 		int counter = 0;
@@ -218,8 +229,8 @@ namespace CustomRendering {
 			int idx = counter++;
 			if (idx/2 == SceneCamIndex) {
 				// Don't show scene camera culling
-				if (VisualizeCullingInScene && ctx.viewType == BatchCullingViewType.Camera)
-					ctx = prevCameraCulling;
+				if (VisualizeCullingInScene && ctx.viewType == BatchCullingViewType.Camera && prevCameraCulling.HasValue)
+					ctx = prevCameraCulling.Value;
 			}
 			else {
 				var data = CopyCullingData(ctx);
