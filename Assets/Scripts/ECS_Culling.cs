@@ -28,6 +28,7 @@ using FrustumPlanes = Unity.Rendering.FrustumPlanes;
 using System.Collections.Generic;
 using System;
 using Unity.Transforms;
+using System.Threading;
 
 // Derived from Unity Entity Graphics rather than reused because it was internal
 
@@ -41,9 +42,11 @@ unsafe partial struct CullEntityInstancesJob : IJobChunk {
 	[ReadOnly] public BatchCullingViewType CullingViewType;
 
 	public UnsafeList<int>.ParallelWriter visibleInstances;
+	public NativeArray<int> test;
 
 	struct ChunkVisiblityFlags {
-		public fixed byte EntityVisible[128];
+		public fixed bool EntityVisible[128];
+		public fixed byte EntityVisibleSplits[128];
 	}
 	struct ChunkVisiblity {
 		public fixed int EntityIndexes[128]; // Instance IDs for drawcalls later
@@ -66,6 +69,10 @@ unsafe partial struct CullEntityInstancesJob : IJobChunk {
 			ref var splits = ref CullingData.Splits;
 				
 			ChunkVisiblityFlags vis;
+			
+			for (int i=0; i<chunk.Count; i++) {
+				vis.EntityVisibleSplits[i] = 0;
+			}
 
 			// First, perform frustum and receiver plane culling for all splits
 			for (int splitIndex = 0; splitIndex < splits.Length; ++splitIndex) {
@@ -78,13 +85,21 @@ unsafe partial struct CullEntityInstancesJob : IJobChunk {
 					AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
 
 					bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
-					vis.EntityVisible[i] |= isVisible ? (byte)1 : (byte)0;
+					vis.EntityVisible[i] |= isVisible;
+
+					if (isVisible) {
+						vis.EntityVisibleSplits[i] |= (byte)(1 << splitIndex);
+					}
 				}
 			}
 			
 			for (int i=0; i<chunk.Count; i++) {
-				if (vis.EntityVisible[i] != 0)
+				if (vis.EntityVisible[i])
 					visible.EntityIndexes[visible.EntityCount++] = baseEntityIdx + i;
+				
+				int splitMask = vis.EntityVisibleSplits[i];
+				ref int count = ref ((int*)test.GetUnsafePtr())[splitMask];
+				Interlocked.Add(ref count, 1);
 			}
 		}
 		else {

@@ -150,6 +150,7 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		// Probably no need to remove batchID from brg
 		DisposeOf(ref brg);
+		DisposeOf(ref metadata);
 		//DisposeOf(ref instanceGraphicsBuffer);
 		instanceGraphicsBuffers.Dispose();
 		curInstanceGraphicsBuffer = null;
@@ -313,10 +314,13 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			// Reuse Unity Culling Utils
 			var cullingData = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
 		
+			NativeArray<int> test = new NativeArray<int>(256, Allocator.TempJob);
+
 			var cullJob = new CullEntityInstancesJob {
 				ChunkBaseEntityIndices = entityIndices,
 				LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
 				visibleInstances = visibleInstances.AsParallelWriter(),
+				test = test,
 				CullingData = cullingData,
 				CullingViewType = cullingContext.viewType,
 			}.ScheduleParallel(query, cullJobDep);
@@ -324,6 +328,14 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			// Need to somehow have visibleInstances.Length be finalized before outputting BatchCullingOutputDrawCommands
 			// TODO: How does Entities.Graphics solve this? Maybe we simply use a reference to BatchCullingOutputDrawCommands and update this from jobs?
 			cullJob.Complete();
+			
+			Debug.Log($"-------------");
+			for (int i=0; i<256; ++i) {
+				if (test[i] > 0)
+					Debug.Log($"Split {Convert.ToString(i, 2)}: Visible Instances: {test[i]}");
+			}
+
+			test.Dispose();
 		
 			UnsafeUtility.MemCpy(visibleInstancesCopy, visibleInstances.Ptr, UnsafeUtility.SizeOf<int>() * NumInstances);
 			visibleCount = visibleInstances.Length;
@@ -336,6 +348,7 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>(), UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 		var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>()  , UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 		
+
 		cmds_out[0] = new BatchCullingOutputDrawCommands {
 			drawCommands     = cmds,
 			drawRanges       = ranges,

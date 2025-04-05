@@ -167,8 +167,8 @@ MonoBehaviour:
   Ratio: 1
   Max: 100000
   Tiling:
-    x: 50
-    y: 50
+    x: 100
+    y: 100
   Spacing: 3
   LODBias: 1
   SpawnPrefab: {fileID: 2129911693363614626, guid: bcb793f88f00f98429bd864c1dd12022, type: 3}
