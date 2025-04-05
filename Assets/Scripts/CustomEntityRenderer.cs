@@ -61,6 +61,36 @@ public class CustomEntityRenderer : MonoBehaviour {
 	}
 }
 
+// Seems to work fine most of the time to use a single GraphicsBuffer (Dispose old one, allocate new one and upload)
+// But sometimes rarely for some reason unity gives a warning about GraphicsBuffer still being in flight
+class UploadBuffer {
+	GraphicsBuffer[] bufs;
+	int next;
+
+	public UploadBuffer (int frames) {
+		bufs = new GraphicsBuffer[frames];
+		next = 0;
+	}
+	public void Dispose () {
+		for (int i=0; i<bufs.Length; i++) {
+			if (bufs[i] != null) {
+				bufs[i].Dispose();
+				bufs[i] = null;
+			}
+		}
+	}
+
+	public GraphicsBuffer GetNext (GraphicsBuffer.Target target, GraphicsBuffer.UsageFlags usage, int count, int stride) {
+		ref var buf = ref bufs[next++];
+		next = next % bufs.Length;
+
+		if (buf != null)
+			buf.Dispose();
+		buf = new GraphicsBuffer(target, usage, count, stride);
+		return buf;
+	}
+}
+
 [UpdateInGroup(typeof(PresentationSystemGroup))]
 [UpdateBefore(typeof(UpdatePresentationSystemGroup))]
 [BurstCompile]
@@ -75,11 +105,16 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	BatchMeshID meshID = BatchMeshID.Null;
 	BatchMaterialID materialID = BatchMaterialID.Null;
 
-	GraphicsBuffer instanceGraphicsBuffer = null;
+	//GraphicsBuffer instanceGraphicsBuffer = null;
+	UploadBuffer instanceGraphicsBuffers = new UploadBuffer(2);
+	GraphicsBuffer curInstanceGraphicsBuffer = null;
+
 	NativeArray<MetadataValue> metadata;
 	BatchID batchID = BatchID.Null;
 	
 	EntityQuery query; // all renderable entities
+
+	JobHandle ComputeInstanceDataJobHandle;
 
 	public unsafe struct InstanceDataBuffer {
 		// Pointers into instanceGraphicsBuffer which is locked for writing
@@ -115,13 +150,20 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		// Probably no need to remove batchID from brg
 		DisposeOf(ref brg);
-		DisposeOf(ref instanceGraphicsBuffer);
+		//DisposeOf(ref instanceGraphicsBuffer);
+		instanceGraphicsBuffers.Dispose();
+		curInstanceGraphicsBuffer = null;
 	}
 	
 	static void DisposeOf<T> (ref T obj) where T: IDisposable {
 		if (obj != null) {
 			obj.Dispose();
 			obj = default(T);
+		}
+	}
+	static void DisposeOf<T> (ref NativeArray<T> obj) where T: struct {
+		if (obj.IsCreated) {
+			obj.Dispose();
 		}
 	}
 	void Remove (ref BatchID obj) {
@@ -160,7 +202,8 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		
 		//Debug.Log($"CustomEntityRenderer.ReallocateInstances() NumInstances: {NumInstances}");
 
-		DisposeOf(ref instanceGraphicsBuffer); // TODO: Only if size changed?
+		//DisposeOf(ref instanceGraphicsBuffer); // TODO: Only if size changed?
+		DisposeOf(ref metadata);
 
 		instanceData = default;
 
@@ -171,12 +214,16 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			int offs1 = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_WorldToObject
 			int offs2 = AddAligned(ref total_size, NumInstances * sizeof(float4), sizeof(float4)); // _BaseColor
 
-			instanceGraphicsBuffer = new GraphicsBuffer(
+			//instanceGraphicsBuffer = new GraphicsBuffer(
+			//	GraphicsBuffer.Target.Raw,
+			//	GraphicsBuffer.UsageFlags.LockBufferForWrite,
+			//	total_size / sizeof(int), sizeof(int));
+			curInstanceGraphicsBuffer = instanceGraphicsBuffers.GetNext(
 				GraphicsBuffer.Target.Raw,
 				GraphicsBuffer.UsageFlags.LockBufferForWrite,
 				total_size / sizeof(int), sizeof(int));
 
-			NativeArray<int> write_buf = instanceGraphicsBuffer.LockBufferForWrite<int>(0, instanceGraphicsBuffer.count);
+			NativeArray<int> write_buf = curInstanceGraphicsBuffer.LockBufferForWrite<int>(0, curInstanceGraphicsBuffer.count);
 			var ptr = (byte*)write_buf.GetUnsafePtr();
 			UnsafeUtility.MemSet(ptr, 0, 64);
 
@@ -186,7 +233,7 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 				color = (float4*)(ptr + offs2),
 			};
 
-			metadata = new NativeArray<MetadataValue>(3, Allocator.Temp);
+			metadata = new NativeArray<MetadataValue>(3, Allocator.TempJob);
 			metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)offs0 };
 			metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)offs1 };
 			metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("_BaseColor"         ), Value = 0x80000000 | (uint)offs2 };
@@ -201,9 +248,11 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		Remove(ref batchID);
 
 		if (NumInstances > 0) {
-			instanceGraphicsBuffer.UnlockBufferAfterWrite<int>(instanceGraphicsBuffer.count);
+			curInstanceGraphicsBuffer.UnlockBufferAfterWrite<int>(curInstanceGraphicsBuffer.count);
 		
-			batchID = brg.AddBatch(metadata, instanceGraphicsBuffer.bufferHandle);
+			batchID = brg.AddBatch(metadata, curInstanceGraphicsBuffer.bufferHandle);
+			
+			curInstanceGraphicsBuffer = null; // Mark as used
 		}
 
 		perfUpload.End();
@@ -216,17 +265,18 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		
 		ReallocateInstances();
 
-		if (NumInstances > 0) {
-			var instDataJob = new ComputeInstanceDataJob{ instanceData = instanceData }
-				.ScheduleParallel(query, Dependency);
+		ComputeInstanceDataJobHandle = new JobHandle(); // default for NumInstances==0 case
 
+		if (NumInstances > 0) {
 			entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out cullJobDep);
 
-			instDataJob.Complete(); // Have to complete for ReuploadInstanceGraphicsBuffer!
+			ComputeInstanceDataJobHandle = new ComputeInstanceDataJob{ instanceData = instanceData }
+				.ScheduleParallel(query, Dependency);
+
+			//instDataJob.Complete(); // Have to complete for ReuploadInstanceGraphicsBuffer!
 		}
 
-		ReuploadInstanceGraphicsBuffer();
-		// Dispose of GraphicsBuffer?
+		//ReuploadInstanceGraphicsBuffer();
 
 		// TODO: defer instDataJob.Complete() + ReuploadInstanceGraphicsBuffer to OnPerformCulling because that runs potentially way later in the frame, and this we might hide wait
 	}
@@ -242,6 +292,11 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	#if UNITY_EDITOR
 		CustomEntityRenderer.inst.dbg.OnCulling(ref cullingContext);
 	#endif
+
+		if (curInstanceGraphicsBuffer != null) {
+			ComputeInstanceDataJobHandle.Complete();
+			ReuploadInstanceGraphicsBuffer();
+		}
 
 		if (NumInstances <= 0)
 			return new JobHandle();
