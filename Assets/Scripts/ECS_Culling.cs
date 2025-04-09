@@ -116,7 +116,12 @@ namespace CustomRendering {
 		public static int AddInstance (ref NativeArray<DrawCommand> cmds, int cmdId) {
 			ref var cmd = ref ((DrawCommand*)cmds.GetUnsafePtr())[cmdId];
 			int newCount = Interlocked.Add(ref cmd.visibleInstances, 1);
-			return newCount-1; // return offset that was assigned
+			return newCount - 1; // return offset that was assigned
+		}
+		public static int AddInstances (ref NativeArray<DrawCommand> cmds, int cmdId, int count) {
+			ref var cmd = ref ((DrawCommand*)cmds.GetUnsafePtr())[cmdId];
+			int newCount = Interlocked.Add(ref cmd.visibleInstances, count);
+			return newCount - count; // return offset range that was assigned
 		}
 	}
 
@@ -135,7 +140,20 @@ namespace CustomRendering {
 
 		unsafe struct SplitCounts {
 			public fixed int visibleCount[16];
+			public fixed int outputInstanceOffset[16];
 		}
+
+		// CullingSplits works like this:
+		// For camera: SplitPlanePackets contain presumably the 6 planes of the camera frustrum against which an AABB can be tested
+		//  however these are stored in a SIMD way that tests 4(?) Planes at once
+		// For BatchCullingViewType.Light (Directional shadows in my case):
+		//  CullingData.ReceiverPlanePackets:
+		//     I think contain the entire shadowmap volume (no splits)
+		//  CullingData.SplitAndReceiverPlanePackets(for split):
+		//     I think contain shadowmap volume split up with additional planes in attempt to cull away shadow cascades that instance does not touch
+		//  CullingData.ReceiverSphereCuller:
+		//     Seems to be a way to further cull instances because bigger shadow map cascades actually overlap smaller ones?
+		//     But this really confuses me
 
 		[BurstCompile]
 		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 enabledMaskIn) {
@@ -150,18 +168,18 @@ namespace CustomRendering {
 
 			for (int i=0; i<chunk.Count; i++) {
 				vis.EntityVisible[i] = 0;
+				vis.InstanceOffset[i] = 0;
 			}
 
 			if (CullingViewType == BatchCullingViewType.Light) {
 				ref var splits = ref CullingData.Splits;
 				Assert.IsTrue(splits.Length <= 4);
-			
-				//SplitCounts splitCounts;
 
-				// First, perform frustum and receiver plane culling for all splits
+				// Do per-instance culling for all splits
 				for (int splitIndex = 0; splitIndex < splits.Length; ++splitIndex) {
 					var split = splits[splitIndex];
-					var splitPlanes = CullingData.SplitPlanePackets.GetSubNativeArray(split.PlanePacketOffset, split.PlanePacketCount);
+					var splitPlanes = CullingData.CombinedSplitAndReceiverPlanePackets.GetSubNativeArray(
+						split.CombinedPlanePacketOffset, split.CombinedPlanePacketCount);
 
 					for (int i=0; i<chunk.Count; i++) {
 						AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
@@ -172,34 +190,63 @@ namespace CustomRendering {
 						}
 					}
 				}
-			
-
-				//for (int splitMask=0; splitMask<16; ++splitMask) {
-				//	splitCounts.visibleCount[splitMask] = 0;
-				//}
 				
-				bool anyVisible = false;
+				// TODO: optimize by using bitscan instructions to quickly skip culled entities,
+				// this is only relevant after first culling pass or if many entities are disabled beforehand (like invisible lod level)
 
+				// I don't understand what SphereTesting actually is for, but this mimics Entity.Graphics
+				if (CullingData.SphereTestEnabled) {
+					
+					// Instances are culled either through CombinedSplitAndReceiverPlanePackets or later through SphereTest
+					for (int i=0; i<chunk.Count; i++) {
+						if (vis.EntityVisible[i] > 0) {
+							AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
+						
+							int sphereSplitMask = CullingData.ReceiverSphereCuller.Cull(aabb);
+
+							vis.EntityVisible[i] &= (byte)sphereSplitMask;
+						}
+					}
+				}
+				
+				// Count visible instances for each draw (unique combination of splits an instance is drawn in)
+				SplitCounts splitCounts;
+				for (int splitMask=0; splitMask<16; ++splitMask) {
+					splitCounts.visibleCount[splitMask] = 0;
+				}
+				
 				for (int i=0; i<chunk.Count; i++) {
 					var splitMask = vis.EntityVisible[i];
 					if (splitMask > 0) {
-						//splitCounts.visibleCount[splitMask]++;
-
-						vis.InstanceOffset[i] = DrawCommand.AddInstance(ref drawCommands, splitMask);
+						// Increment visible instances for this draw and chunk
+						int localIdx = splitCounts.visibleCount[splitMask];
+						splitCounts.visibleCount[splitMask]++;
+						// remeber local index temporarily
+						vis.InstanceOffset[i] = localIdx;
+					}
+				}
+				
+				// allocate space in output instances for draw in bulk
+				for (int splitMask=0; splitMask<16; ++splitMask) {
+					// visible instances for this draw
+					int count = splitCounts.visibleCount[splitMask];
+					// count instances have been allocated at offset for this draw (happens in parallel with other chunks)
+					int offset = DrawCommand.AddInstances(ref drawCommands, splitMask, count);
+					// remember offset
+					splitCounts.outputInstanceOffset[splitMask] = offset;
+				}
+				
+				bool anyVisible = false;
+				// count instances again to 
+				for (int i=0; i<chunk.Count; i++) {
+					var splitMask = vis.EntityVisible[i];
+					if (splitMask > 0) {
+						// add in actual offset for output instance ids (Could be skipped if outputInstanceOffset is passed to WriteDrawInstanceIndicesJob)
+						vis.InstanceOffset[i] += splitCounts.outputInstanceOffset[splitMask];
 						
 						anyVisible = true;
 					}
 				}
-			
-				//bool anyVisible = false;
-				//for (int splitMask=0; splitMask<16; ++splitMask) {
-				//	if (splitCounts.visibleCount[splitMask] > 0) {
-				//		ref var cmd = ref ((DrawCommand*)drawCommands.GetUnsafePtr())[splitMask];
-				//		int newCount = Interlocked.Add(ref cmd.visibleInstances, splitCounts.visibleCount[splitMask]);
-				//
-				//		anyVisible = true;
-				//	}
-				//}
 
 				if (anyVisible)
 					chunkVisibilty.AddNoResize(vis);
@@ -216,16 +263,21 @@ namespace CustomRendering {
 					bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
 					vis.EntityVisible[i] = isVisible ? (byte)1 : (byte)0;
 					if (isVisible) {
-						visibleCount++;
-
-						vis.InstanceOffset[i] = DrawCommand.AddInstance(ref drawCommands, 1);
+						vis.InstanceOffset[i] = visibleCount++;
 					}
 				}
-
-				if (visibleCount > 0) {
-					//ref var cmd = ref ((DrawCommand*)drawCommands.GetUnsafePtr())[0];
-					//Interlocked.Add(ref cmd.visibleInstances, visibleCount);
 				
+				if (visibleCount > 0) {
+					int offset = DrawCommand.AddInstances(ref drawCommands, 1, visibleCount);
+				
+					// count instances again to 
+					for (int i=0; i<chunk.Count; i++) {
+						bool isVisible = vis.EntityVisible[i] > 0;
+						if (isVisible) {
+							vis.InstanceOffset[i] += offset;
+						}
+					}
+
 					chunkVisibilty.AddNoResize(vis);
 				}
 			}
@@ -288,7 +340,6 @@ namespace CustomRendering {
 						materialID = materialID,
 						meshID = meshID,
 						submeshIndex = 0,
-						//splitVisibilityMask = 0xff
 						splitVisibilityMask = (ushort)splitMask,
 						flags = 0,
 						sortingPosition = 0,
