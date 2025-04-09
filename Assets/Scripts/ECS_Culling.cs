@@ -30,97 +30,6 @@ using System;
 using Unity.Transforms;
 using System.Threading;
 
-// Derived from Unity Entity Graphics rather than reused because it was internal
-
-[BurstCompile]
-unsafe partial struct CullEntityInstancesJob : IJobChunk {
-	[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
-	[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransformHandle;
-	//[ReadOnly] public SharedComponentTypeHandle<CustomRenderAsset> CustomRenderAssetHandle;
-
-	[ReadOnly] public CustomRendering.CullingSplits CullingData;
-	[ReadOnly] public BatchCullingViewType CullingViewType;
-
-	public UnsafeList<int>.ParallelWriter visibleInstances;
-	public NativeArray<int> test;
-
-	struct ChunkVisiblityFlags {
-		public fixed bool EntityVisible[128];
-		public fixed byte EntityVisibleSplits[128];
-	}
-	struct ChunkVisiblity {
-		public fixed int EntityIndexes[128]; // Instance IDs for drawcalls later
-		public int EntityCount;
-	}
-
-	[BurstCompile]
-	public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 enabledMaskIn) {
-		Assert.IsFalse(useEnabledMask);
-
-		NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransformHandle);
-		//var assetIdx = chunk.GetSharedComponentIndex(CustomRenderAssetHandle);
-
-		var baseEntityIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
-
-		ChunkVisiblity visible;
-		visible.EntityCount = 0;
-
-		if (CullingViewType == BatchCullingViewType.Light) {
-			ref var splits = ref CullingData.Splits;
-				
-			ChunkVisiblityFlags vis;
-			
-			for (int i=0; i<chunk.Count; i++) {
-				vis.EntityVisibleSplits[i] = 0;
-			}
-
-			// First, perform frustum and receiver plane culling for all splits
-			for (int splitIndex = 0; splitIndex < splits.Length; ++splitIndex) {
-				var split = splits[splitIndex];
-				byte splitMask = (byte)(1 << splitIndex);
-
-				var splitPlanes = CullingData.SplitPlanePackets.GetSubNativeArray(split.PlanePacketOffset, split.PlanePacketCount);
-
-				for (int i=0; i<chunk.Count; i++) {
-					AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
-
-					bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
-					vis.EntityVisible[i] |= isVisible;
-
-					if (isVisible) {
-						vis.EntityVisibleSplits[i] |= (byte)(1 << splitIndex);
-					}
-				}
-			}
-			
-			for (int i=0; i<chunk.Count; i++) {
-				if (vis.EntityVisible[i])
-					visible.EntityIndexes[visible.EntityCount++] = baseEntityIdx + i;
-				
-				int splitMask = vis.EntityVisibleSplits[i];
-				ref int count = ref ((int*)test.GetUnsafePtr())[splitMask];
-				Interlocked.Add(ref count, 1);
-			}
-		}
-		else {
-			Assert.IsTrue(CullingData.Splits.Length == 1);
-
-			var splitPlanes = CullingData.SplitPlanePackets.AsNativeArray();
-
-			for (int i=0; i<chunk.Count; i++) {
-				AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
-
-				bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
-				if (isVisible)
-					visible.EntityIndexes[visible.EntityCount++] = baseEntityIdx + i;
-			}
-		}
-
-		if (visible.EntityCount > 0)
-			visibleInstances.AddRangeNoResize(visible.EntityIndexes, visible.EntityCount);
-	}
-}
-
 public static class CullingExtensions {
 	// We want to use UnsafeList to use RewindableAllocator, but PlanePacket APIs want NativeArrays
 	public static unsafe NativeArray<T> AsNativeArray<T> (this UnsafeList<T> list) where T : unmanaged {
@@ -190,6 +99,248 @@ public static class CullingExtensions {
 
 namespace CustomRendering {
 	
+	// Derived from Unity Entity Graphics rather than reused because it was internal
+
+	unsafe struct ChunkVisiblity {
+		public ArchetypeChunk chunk;
+		public int BaseInstanceIdx;
+
+		public fixed byte EntityVisible[128]; // either bool for camera culling or split mask for light culling
+		public fixed int InstanceOffset[128]; // offsets within their split
+	}
+	unsafe struct DrawCommand {
+		// could use BatchDrawCommand.visibleCount
+		public int visibleInstances;
+		public BatchDrawCommand* cmd;
+
+		public static int AddInstance (ref NativeArray<DrawCommand> cmds, int cmdId) {
+			ref var cmd = ref ((DrawCommand*)cmds.GetUnsafePtr())[cmdId];
+			int newCount = Interlocked.Add(ref cmd.visibleInstances, 1);
+			return newCount-1; // return offset that was assigned
+		}
+	}
+
+		[BurstCompile]
+	unsafe partial struct CullEntityInstancesJob : IJobChunk {
+
+		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
+		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransformHandle;
+		//[ReadOnly] public SharedComponentTypeHandle<CustomRenderAsset> CustomRenderAssetHandle;
+
+		[ReadOnly] public CullingSplits CullingData;
+		[ReadOnly] public BatchCullingViewType CullingViewType;
+
+		public NativeList<ChunkVisiblity>.ParallelWriter chunkVisibilty;
+		public NativeArray<DrawCommand> drawCommands;
+
+		unsafe struct SplitCounts {
+			public fixed int visibleCount[16];
+		}
+
+		[BurstCompile]
+		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 enabledMaskIn) {
+			Assert.IsFalse(useEnabledMask);
+		
+			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransformHandle);
+			//var assetIdx = chunk.GetSharedComponentIndex(CustomRenderAssetHandle);
+		
+			ChunkVisiblity vis;
+			vis.chunk = chunk;
+			vis.BaseInstanceIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
+
+			for (int i=0; i<chunk.Count; i++) {
+				vis.EntityVisible[i] = 0;
+			}
+
+			if (CullingViewType == BatchCullingViewType.Light) {
+				ref var splits = ref CullingData.Splits;
+				Assert.IsTrue(splits.Length <= 4);
+			
+				//SplitCounts splitCounts;
+
+				// First, perform frustum and receiver plane culling for all splits
+				for (int splitIndex = 0; splitIndex < splits.Length; ++splitIndex) {
+					var split = splits[splitIndex];
+					var splitPlanes = CullingData.SplitPlanePackets.GetSubNativeArray(split.PlanePacketOffset, split.PlanePacketCount);
+
+					for (int i=0; i<chunk.Count; i++) {
+						AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
+
+						bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
+						if (isVisible) {
+							vis.EntityVisible[i] |= (byte)(1 << splitIndex);
+						}
+					}
+				}
+			
+
+				//for (int splitMask=0; splitMask<16; ++splitMask) {
+				//	splitCounts.visibleCount[splitMask] = 0;
+				//}
+				
+				bool anyVisible = false;
+
+				for (int i=0; i<chunk.Count; i++) {
+					var splitMask = vis.EntityVisible[i];
+					if (splitMask > 0) {
+						//splitCounts.visibleCount[splitMask]++;
+
+						vis.InstanceOffset[i] = DrawCommand.AddInstance(ref drawCommands, splitMask);
+						
+						anyVisible = true;
+					}
+				}
+			
+				//bool anyVisible = false;
+				//for (int splitMask=0; splitMask<16; ++splitMask) {
+				//	if (splitCounts.visibleCount[splitMask] > 0) {
+				//		ref var cmd = ref ((DrawCommand*)drawCommands.GetUnsafePtr())[splitMask];
+				//		int newCount = Interlocked.Add(ref cmd.visibleInstances, splitCounts.visibleCount[splitMask]);
+				//
+				//		anyVisible = true;
+				//	}
+				//}
+
+				if (anyVisible)
+					chunkVisibilty.AddNoResize(vis);
+			}
+			else {
+				Assert.IsTrue(CullingData.Splits.Length == 1);
+
+				var splitPlanes = CullingData.SplitPlanePackets.AsNativeArray();
+			
+				int visibleCount = 0;
+				for (int i=0; i<chunk.Count; i++) {
+					AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
+
+					bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
+					vis.EntityVisible[i] = isVisible ? (byte)1 : (byte)0;
+					if (isVisible) {
+						visibleCount++;
+
+						vis.InstanceOffset[i] = DrawCommand.AddInstance(ref drawCommands, 1);
+					}
+				}
+
+				if (visibleCount > 0) {
+					//ref var cmd = ref ((DrawCommand*)drawCommands.GetUnsafePtr())[0];
+					//Interlocked.Add(ref cmd.visibleInstances, visibleCount);
+				
+					chunkVisibilty.AddNoResize(vis);
+				}
+			}
+		}
+	}
+
+	[BurstCompile]
+	unsafe partial struct AllocDrawCommandsJob : IJob {
+	
+		[ReadOnly] public BatchMeshID meshID;
+		[ReadOnly] public BatchMaterialID materialID;
+		[ReadOnly] public BatchID batchID;
+
+		public NativeArray<BatchCullingOutputDrawCommands> cullingOutputCommands;
+		public NativeArray<DrawCommand> drawCommands;
+
+		public void Execute () {
+			int drawCommandsCount = 0;
+			int visibleInstanceCount = 0;
+		
+			for (int splitMask=0; splitMask<16; ++splitMask) {
+				if (drawCommands[splitMask].visibleInstances > 0) {
+					drawCommandsCount++;
+					visibleInstanceCount += drawCommands[splitMask].visibleInstances;
+				}
+			}
+
+			// These are auto-freed by the batch renderer
+			var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>()*drawCommandsCount, UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
+			var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>(), UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
+			var visibleInstances = (int*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<int>() * visibleInstanceCount, UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
+		
+			cullingOutputCommands[0] = new BatchCullingOutputDrawCommands {
+				drawCommands     = cmds,
+				drawRanges       = ranges,
+				visibleInstances = visibleInstances,
+				drawCommandPickingInstanceIDs = null,
+
+				drawCommandCount = 1,
+				drawRangeCount = 1,
+				visibleInstanceCount = visibleInstanceCount,
+
+				instanceSortingPositions = null,
+				instanceSortingPositionFloatCount = 0,
+			};
+		
+			int visibleOffset = 0;
+			BatchDrawCommand* curBatchCmd = cmds;
+			for (int splitMask=0; splitMask<16; ++splitMask) {
+				var cmd = drawCommands[splitMask];
+
+				if (cmd.visibleInstances > 0) {
+					cmd.cmd = curBatchCmd++; // Get next command from allocated BatchDrawCommands
+
+					*cmd.cmd = new BatchDrawCommand {
+						visibleOffset = (uint)visibleOffset,
+						visibleCount = (uint)cmd.visibleInstances,
+
+						batchID = batchID,
+						materialID = materialID,
+						meshID = meshID,
+						submeshIndex = 0,
+						//splitVisibilityMask = 0xff
+						splitVisibilityMask = (ushort)splitMask,
+						flags = 0,
+						sortingPosition = 0,
+					};
+
+					visibleOffset += cmd.visibleInstances;
+
+					drawCommands[splitMask] = cmd;
+				}
+			}
+
+			ranges[0] = new BatchDrawRange {
+				drawCommandsType = BatchDrawCommandType.Direct,
+				drawCommandsBegin = 0,
+				drawCommandsCount = (uint)drawCommandsCount,
+				filterSettings = new BatchFilterSettings {
+					renderingLayerMask = 0xffffffff,
+					receiveShadows = true,
+					shadowCastingMode = ShadowCastingMode.On // Should I not get this from the material? How?
+				},
+			};
+		}
+	}
+
+	[BurstCompile]
+	unsafe partial struct WriteDrawInstanceIndicesJob : IJobParallelForDefer {
+	
+		[ReadOnly] public NativeArray<ChunkVisiblity> chunkVisibilty;
+		[ReadOnly] public NativeArray<DrawCommand> drawCommands;
+	
+		[ReadOnly] public NativeArray<BatchCullingOutputDrawCommands> cullingOutputCommands;
+
+		public void Execute (int index) {
+			var vis = chunkVisibilty[index];
+			int* outputInstances = cullingOutputCommands[0].visibleInstances;
+
+			for (int i=0; i<vis.chunk.Count; i++) {
+				int InstanceIdx = vis.BaseInstanceIdx + i;
+			
+				byte splitMask = vis.EntityVisible[i];
+				if (splitMask > 0) {
+					var cmd = drawCommands[splitMask];
+
+					int outputIdx = vis.InstanceOffset[i] + (int)cmd.cmd->visibleOffset;
+					outputInstances[outputIdx] = InstanceIdx;
+				}
+			}
+		}
+	}
+
+
+
 #if UNITY_EDITOR
 	// Fun Visualization of Culling of Game view camera in Scene view, not safe at all!
 	[System.Serializable]
@@ -244,7 +395,9 @@ namespace CustomRendering {
 			int idx = counter++;
 			if (idx/2 == SceneCamIndex) {
 				// Don't show scene camera culling
-				if (VisualizeCullingInScene && ctx.viewType == BatchCullingViewType.Camera && prevCameraCulling.HasValue)
+				if (  VisualizeCullingInScene &&
+					  (ctx.viewType == ShowType || ctx.viewType == BatchCullingViewType.Camera) &&
+					  prevCameraCulling.HasValue)
 					ctx = prevCameraCulling.Value;
 			}
 			else {
@@ -252,7 +405,7 @@ namespace CustomRendering {
 
 				culling.Add(data);
 
-				if (ctx.viewType == BatchCullingViewType.Camera)
+				if (ctx.viewType == ShowType)
 					prevCameraCulling = data;
 			}
 		}

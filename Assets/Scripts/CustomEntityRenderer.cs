@@ -19,6 +19,7 @@ using Unity.Transforms;
 using Unity.Profiling;
 using Unity.Burst.Intrinsics;
 using Unity.Assertions;
+using CustomRendering;
 using FrustumPlanes = Unity.Rendering.FrustumPlanes;
 
 public class CustomEntityRenderer : MonoBehaviour {
@@ -27,7 +28,7 @@ public class CustomEntityRenderer : MonoBehaviour {
 
 #if UNITY_EDITOR
 	public static CustomEntityRenderer inst;
-	public CustomRendering.VisCulling dbg = new();
+	public VisCulling dbg = new();
 
 	void LateUpdate () {
 		dbg.Draw();
@@ -288,8 +289,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 			BatchCullingContext cullingContext,
 			BatchCullingOutput cullingOutput,
 			IntPtr userContext) {
-		//Debug.Log($"CustomEntityRenderer.OnPerformCulling {cullingContext.viewType}");
-		
 	#if UNITY_EDITOR
 		CustomEntityRenderer.inst.dbg.OnCulling(ref cullingContext);
 	#endif
@@ -305,92 +304,58 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		//Debug.Log($"CustomEntityRenderer.OnPerformCulling() NumInstances: {NumInstances}");
 
 		perfCmd.Begin();
-		
-		var visibleInstancesCopy = (int*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<int>() * NumInstances, UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
-		int visibleCount;
-		{
-			var visibleInstances = new UnsafeList<int>(NumInstances, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-		
-			// Reuse Unity Culling Utils
-			var cullingData = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
-		
-			NativeArray<int> test = new NativeArray<int>(256, Allocator.TempJob);
-
-			var cullJob = new CullEntityInstancesJob {
-				ChunkBaseEntityIndices = entityIndices,
-				LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
-				visibleInstances = visibleInstances.AsParallelWriter(),
-				test = test,
-				CullingData = cullingData,
-				CullingViewType = cullingContext.viewType,
-			}.ScheduleParallel(query, cullJobDep);
-
-			// Need to somehow have visibleInstances.Length be finalized before outputting BatchCullingOutputDrawCommands
-			// TODO: How does Entities.Graphics solve this? Maybe we simply use a reference to BatchCullingOutputDrawCommands and update this from jobs?
-			cullJob.Complete();
-			
-			Debug.Log($"-------------");
-			for (int i=0; i<256; ++i) {
-				if (test[i] > 0)
-					Debug.Log($"Split {Convert.ToString(i, 2)}: Visible Instances: {test[i]}");
-			}
-
-			test.Dispose();
-		
-			UnsafeUtility.MemCpy(visibleInstancesCopy, visibleInstances.Ptr, UnsafeUtility.SizeOf<int>() * NumInstances);
-			visibleCount = visibleInstances.Length;
-			visibleInstances.Dispose();
-		}
 
 	////
-		var cmds_out = (BatchCullingOutputDrawCommands*)cullingOutput.drawCommands.GetUnsafePtr();
-		// These are supposedly auto-freed by the batch renderer
-		var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>(), UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
-		var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>()  , UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
+		// Reuse Unity Culling Utils
+		var cullingData = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
 		
+		int NumChunks = query.CalculateChunkCount();
+		var chunkVisibilty = new NativeList<ChunkVisiblity>(NumChunks, Allocator.TempJob);
+		var drawCommands  = new NativeArray<DrawCommand>(16, Allocator.TempJob, NativeArrayOptions.ClearMemory);
 
-		cmds_out[0] = new BatchCullingOutputDrawCommands {
-			drawCommands     = cmds,
-			drawRanges       = ranges,
-			//visibleInstances = visibleInstances.Ptr, // Does this cause UnsafeList to be freed correctly?
-			visibleInstances = visibleInstancesCopy, // Does this cause UnsafeList to be freed correctly?
-			drawCommandPickingInstanceIDs = null,
+		var cullJob = new CullEntityInstancesJob {
+			ChunkBaseEntityIndices = entityIndices,
+			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
+			chunkVisibilty = chunkVisibilty.AsParallelWriter(),
+			drawCommands = drawCommands,
+			CullingData = cullingData,
+			CullingViewType = cullingContext.viewType,
+		}.ScheduleParallel(query, cullJobDep);
 
-			drawCommandCount = 1,
-			drawRangeCount = 1,
-			visibleInstanceCount = NumInstances,
+		var allocCmdsJob = new AllocDrawCommandsJob {
+			meshID = meshID, materialID = materialID, batchID = batchID, // Instead set up BatchCullingOutputDrawCommands inside here and only modify?
+			cullingOutputCommands = cullingOutput.drawCommands,
+			drawCommands = drawCommands,
+		}.Schedule(cullJob);
+		
+		var writeInstancesJob = new WriteDrawInstanceIndicesJob {
+			chunkVisibilty = chunkVisibilty.AsDeferredJobArray(),
+			drawCommands = drawCommands,
+			cullingOutputCommands = cullingOutput.drawCommands,
+		}.Schedule(chunkVisibilty, 8, allocCmdsJob);
 
-			instanceSortingPositions = null,
-			instanceSortingPositionFloatCount = 0,
-		};
-
-		cmds[0] = new BatchDrawCommand {
-			visibleOffset = 0,
-			//visibleCount = (uint)visibleInstances.Length,
-			visibleCount = (uint)visibleCount,
-			batchID = batchID,
-			materialID = materialID,
-			meshID = meshID,
-			submeshIndex = 0,
-			splitVisibilityMask = 0xff, // TODO: Currently rendering in all shadow cascades!
-			flags = 0,
-			sortingPosition = 0,
-		};
-
-		ranges[0] = new BatchDrawRange {
-			drawCommandsType = BatchDrawCommandType.Direct,
-			drawCommandsBegin = 0,
-			drawCommandsCount = 1,
-			filterSettings = new BatchFilterSettings {
-				renderingLayerMask = 0xffffffff,
-				receiveShadows = true,
-				shadowCastingMode = ShadowCastingMode.On // Should I not get this from the material? How?
-			},
-		};
+	#if false
+		// Complete for testing
+		writeInstancesJob.Complete();
+		
+		Debug.Log($"-------------");
+		for (int splitMask=0; splitMask<16; ++splitMask) {
+			if (drawCommands[splitMask].visibleInstances > 0)
+				Debug.Log($"Cmd {Convert.ToString(splitMask, 2)}: Visible Instances: {drawCommands[splitMask].visibleInstances}");
+		}
+		
+		chunkVisibilty.Dispose(writeInstancesJob);
+		drawCommands.Dispose(writeInstancesJob);
 
 		perfCmd.End();
-		//return cullJob;
 		return new JobHandle();
+	#else
+		chunkVisibilty.Dispose(writeInstancesJob);
+		drawCommands.Dispose(writeInstancesJob);
+
+		perfCmd.End();
+		return writeInstancesJob;
+	#endif
 	}
 	
 	[BurstCompile]
