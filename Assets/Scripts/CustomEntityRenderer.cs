@@ -85,9 +85,14 @@ class UploadBuffer {
 		ref var buf = ref bufs[next++];
 		next = next % bufs.Length;
 
-		if (buf != null)
-			buf.Dispose();
-		buf = new GraphicsBuffer(target, usage, count, stride);
+		//if (buf != null)
+		//	buf.Dispose();
+		//buf = new GraphicsBuffer(target, usage, count, stride);
+
+		// This avoids visible stalls (waiting for render thread) in Vulkan, not tested if fps gain in d3d
+		// But probably indicates that I need to use different method to upload data as I can't completely avoid ever allocating new GraphicsBuffer
+		if (buf == null || buf.count != count)
+			buf = new GraphicsBuffer(target, usage, count, stride);
 		return buf;
 	}
 }
@@ -107,7 +112,7 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	BatchMaterialID materialID = BatchMaterialID.Null;
 
 	//GraphicsBuffer instanceGraphicsBuffer = null;
-	UploadBuffer instanceGraphicsBuffers = new UploadBuffer(2);
+	UploadBuffer instanceGraphicsBuffers = new UploadBuffer(3);
 	GraphicsBuffer curInstanceGraphicsBuffer = null;
 
 	NativeArray<MetadataValue> metadata;
