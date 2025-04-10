@@ -171,7 +171,12 @@ MonoBehaviour:
     y: 100
   Spacing: 3
   LODBias: 1
+  ChunkGridSize:
+    x: 16
+    y: 16
+    z: 16
   SpawnPrefab: {fileID: 2129911693363614626, guid: bcb793f88f00f98429bd864c1dd12022, type: 3}
+  DebugSpatialGrid: 0
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

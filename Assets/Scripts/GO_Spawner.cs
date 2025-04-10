@@ -4,7 +4,10 @@ using static Unity.Mathematics.math;
 
 public class GO_Spawner : MonoBehaviour {
 	public static GO_Spawner inst;
-	void Start () {
+	void Awake () { // Enable even if disabled initially
+		inst = this;
+	}
+	void Start () { // for script reload (?)
 		inst = this;
 	}
 

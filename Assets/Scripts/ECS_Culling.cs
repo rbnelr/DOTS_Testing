@@ -182,7 +182,7 @@ namespace CustomRendering {
 						split.CombinedPlanePacketOffset, split.CombinedPlanePacketCount);
 
 					for (int i=0; i<chunk.Count; i++) {
-						AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
+						AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack, TODO: shared mesh asset AABB Transform with local transform, cache these AABB after a initial pass in the job?
 
 						bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
 						if (isVisible) {

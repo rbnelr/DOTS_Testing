@@ -22,40 +22,28 @@ public class Controller : MonoBehaviour {
 
 	public float LODBias = 1;
 
+	public int3 ChunkGridSize = int3(10, 10, 10);
+
 	public GameObject SpawnPrefab;
+
+	public bool DebugSpatialGrid = false;
 
 	class Baker : Baker<Controller> {
 		public override void Bake (Controller authoring) {
 			var entity = GetEntity(TransformUsageFlags.None);
-
-			// Create CustomSpawnPrefab during baking, which lets us put it into ControllerECS so the spawner can access it
-			var customPrefab = CreateAdditionalEntity(TransformUsageFlags.ManualOverride, false, "CustomSpawnPrefab");
-			{
-				AddComponent<Prefab>(customPrefab);
-				AddComponent<SpinningSystem.Tag>(customPrefab);
-				AddComponent<LocalTransform>(customPrefab);
-
-				var mesh = authoring.SpawnPrefab.GetComponent<MeshFilter>().sharedMesh;
-				var mats = authoring.SpawnPrefab.GetComponent<MeshRenderer>().sharedMaterials;
-				AddSharedComponentManaged(customPrefab, new CustomRenderAsset(mesh, mats));
-
-				// Implement LOD later
-				//var rma = EntityManager.GetSharedComponentManaged<RenderMeshArray>(SpawnPrefab);
-				//EntityManager.SetSharedComponentManaged(customPrefab,
-				//	new CustomRenderAsset(rma.MeshReferences[0], rma.MaterialReferences.Select(x => x.Value).ToArray()));
-			}
-
-
 			AddComponent(entity, new ControllerECS {
 				Mode = authoring.Mode,
 				Respawn = true, // Respawn whenever inspector changes TODO: add way to change entity count in actual build?
 				SpawnPrefab = GetEntity(authoring.SpawnPrefab, TransformUsageFlags.Dynamic),
-				CustomSpawnPrefab = customPrefab,
-				Ratio   = authoring.Ratio  ,
-				Max     = authoring.Max    ,
-				Tiling  = authoring.Tiling ,
-				Spacing = authoring.Spacing,
-				LODBias = authoring.LODBias,
+				CustomSpawnPrefab = Entity.Null, // Create in ControllerECSSystem, as we can't really create custom entities here
+
+				Ratio         = authoring.Ratio  ,
+				Max           = authoring.Max    ,
+				Tiling        = authoring.Tiling ,
+				Spacing       = authoring.Spacing,
+				LODBias       = authoring.LODBias,
+				ChunkGridSize = authoring.ChunkGridSize,
+				DebugSpatialGrid = authoring.DebugSpatialGrid,
 			});;
 		}
 	}
@@ -77,6 +65,10 @@ public struct ControllerECS : IComponentData {
 
 	public float LODBias;
 
+	public int3 ChunkGridSize;
+
+	public bool DebugSpatialGrid;
+
 	public void SwitchMode (int Mode) {
 		this.Mode = Mode;
 		Respawn = true;
@@ -87,45 +79,40 @@ public struct ControllerECS : IComponentData {
 [RequireMatchingQueriesForUpdate]
 public unsafe partial class ControllerECSSystem : SystemBase {
 	
-	bool init;
-	//Entity CustomSpawnPrefab; // putting this in ControllerECS causes issues as entity get forgotten as CustomSpawnPrefab variable is reset when rebaking due to inspector changes
-	
 	protected override void OnCreate () {
 		RequireForUpdate<ControllerECS>(); // Baked scene gets streamed in, so ControllerECS does not exist for a few frames
-		init = true;
 	}
 
 	void Init () {
-		init = false;
-
 		var c = SystemAPI.GetSingleton<ControllerECS>();
-		
-		// Cant do this inside Baker<Controller> for some reason, despite the fact that this is where the SpawnPrefab entity is created,
-		// apparently I could create a seperate script with its own baker which does this and add it to the prefab
-		
-		EntityManager.AddComponent<SpinningSystem.Tag>(c.SpawnPrefab);
 
-		////
-		//var prefab = EntityManager.CreateEntity(
-		//	typeof(Prefab),
-		//	typeof(SpinningSystem.Tag),
-		//	typeof(LocalTransform),
-		//	typeof(CustomRenderAsset)
-		//);
-		//
-		//// Implement LOD later
-		//var rma = EntityManager.GetSharedComponentManaged<RenderMeshArray>(c.SpawnPrefab);
-		//EntityManager.SetSharedComponentManaged(prefab,
-		//	new CustomRenderAsset(rma.MeshReferences[0], rma.MaterialReferences.Select(x => x.Value).ToArray()));
-		//
-		//CustomSpawnPrefab = prefab;
+		if (EntityManager.HasComponent<SpinningSystem.Tag>(c.SpawnPrefab)) {
+			EntityManager.AddComponent<SpinningSystem.Tag>(c.SpawnPrefab);
+		}
+		
+		if (c.CustomSpawnPrefab == Entity.Null) {
+			var prefab = EntityManager.CreateEntity(
+				typeof(LocalTransform),
+				typeof(Prefab),
+				typeof(SpinningSystem.Tag),
+				typeof(CustomRenderAsset),
+				typeof(CustomEntitySpatialGrid)
+			);
+			
+			var rma = EntityManager.GetSharedComponentManaged<RenderMeshArray>(c.SpawnPrefab);
+			EntityManager.SetSharedComponentManaged(prefab,
+				new CustomRenderAsset(rma.MeshReferences[0], rma.MaterialReferences.Select(x => x.Value).ToArray()));
 
-		//SystemAPI.SetSingleton(c);
+			EntityManager.AddChunkComponentData<CustomEntityChunkBounds>(prefab);
+
+			c.CustomSpawnPrefab = prefab;
+		}
+
+		SystemAPI.SetSingleton(c);
 	}
 
 	protected override void OnUpdate () {
-		if (init)
-			Init();
+		Init();
 
 		var c = SystemAPI.GetSingletonRW<ControllerECS>();
 
@@ -147,6 +134,7 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 
 [UpdateInGroup(typeof(SimulationSystemGroup))]
 [UpdateAfter(typeof(SpawnerSystem))]
+[BurstCompile]
 public partial struct SpinningSystem : ISystem {
 	public struct Tag : IComponentData {}
 	

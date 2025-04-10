@@ -16,12 +16,12 @@ using Unity.Entities.Graphics;
 [UpdateInGroup(typeof(SimulationSystemGroup))]
 [UpdateAfter(typeof(ControllerECSSystem))]
 [RequireMatchingQueriesForUpdate]
+[BurstCompile]
 public partial struct SpawnerSystem : ISystem {
 	
 	static readonly ProfilerMarker perfDestroyAll = new ProfilerMarker("SpawnerSystem.DestroyAll");
 	static readonly ProfilerMarker perfSpawnAll  = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll");
-	static readonly ProfilerMarker perfSpawnAll1 = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll1");
-	static readonly ProfilerMarker perfSpawnAll2 = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll2");
+	static readonly ProfilerMarker perfSpawnAll1 = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll.Instantiate");
 	
 	public void OnStartRunning (ref SystemState state) {
 		state.RequireForUpdate<ControllerECS>();
@@ -60,6 +60,7 @@ public partial struct SpawnerSystem : ISystem {
 	
 	[WithAll(typeof(LocalTransform))]
 	[WithNone(typeof(Parent))]
+	[BurstCompile]
 	public partial struct InitJob : IJobEntity {
 		[ReadOnly] public ControllerECS ctrl;
 		
@@ -84,10 +85,7 @@ public partial struct SpawnerSystem : ISystem {
 		perfSpawnAll1.End();
 
 		// initialize entity positions via job
-		perfSpawnAll2.Begin();
-		var job = new InitJob{ ctrl = ctrl }.ScheduleParallel(new JobHandle());
-		job.Complete(); // Complete for profiler timing
-		perfSpawnAll2.End();
+		new InitJob{ ctrl = ctrl }.ScheduleParallel();
 	}
 	
 	[BurstCompile]

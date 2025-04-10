@@ -18,10 +18,8 @@ using UnityEngine.Rendering;
 using Unity.Burst;
 using Unity.Transforms;
 using Unity.Profiling;
-using Unity.Burst.Intrinsics;
-using Unity.Assertions;
 using CustomRendering;
-using FrustumPlanes = Unity.Rendering.FrustumPlanes;
+using Unity.Burst.Intrinsics;
 
 public class CustomEntityRenderer : MonoBehaviour {
 	public Mesh mesh;
@@ -51,16 +49,20 @@ public class CustomEntityRenderer : MonoBehaviour {
 #if UNITY_EDITOR
 		inst = this;
 #endif
-
 		var world = World.DefaultGameObjectInjectionWorld;
-		var sys = world?.GetExistingSystem<CustomEntityRendererSystem>();
-		if (sys.HasValue && sys != SystemHandle.Null) {
-			world.EntityManager.SetComponentData(sys.Value, new CustomEntityRendererSystem.Input {
-				mesh = mesh,
-				material = material,
-			});
-		}
+		var sys = world?.GetExistingSystemManaged<CustomEntityRendererSystem>();
+		if (sys != null) world.EntityManager.SetComponentData(sys.SystemHandle, new CustomEntityRendererSystem.Input {
+			mesh = mesh,
+			material = material,
+		});
 	}
+}
+
+public struct CustomEntitySpatialGrid : ISharedComponentData {
+	public int3 Key;
+}
+public struct CustomEntityChunkBounds : IComponentData {
+	public AABB bounds;
 }
 
 // Seems to work fine most of the time to use a single GraphicsBuffer (Dispose old one, allocate new one and upload)
@@ -100,6 +102,7 @@ class UploadBuffer {
 
 [UpdateInGroup(typeof(PresentationSystemGroup))]
 [UpdateBefore(typeof(UpdatePresentationSystemGroup))]
+[BurstCompile]
 public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	
 	public class Input : IComponentData {
@@ -107,17 +110,15 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		public Material material;
 	}
 
-	BatchRendererGroup brg = null;
-	BatchMeshID meshID = BatchMeshID.Null;
-	BatchMaterialID materialID = BatchMaterialID.Null;
+	BatchRendererGroup brg;
+	BatchMeshID meshID;
+	BatchMaterialID materialID;
 
-	UploadBuffer instanceGraphicsBuffers = new UploadBuffer(3);
-	GraphicsBuffer curInstanceGraphicsBuffer = null;
+	UploadBuffer instanceGraphicsBuffers;
+	GraphicsBuffer curInstanceGraphicsBuffer;
 
 	NativeArray<MetadataValue> metadata;
-	BatchID batchID = BatchID.Null;
-	
-	EntityQuery query; // all renderable entities
+	BatchID batchID;
 
 	JobHandle ComputeInstanceDataJobHandle;
 
@@ -134,16 +135,18 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		}
 	};
 	InstanceDataBuffer instanceData;
-	
+
 	protected override void OnCreate () {
 		Debug.Log("CustomEntityRendererSystem.OnCreate");
+		
+		EntityManager.AddComponent<Input>(SystemHandle);
 
-		World.EntityManager.AddComponent<Input>(SystemHandle);
+		RequireForUpdate<ControllerECS>();
 	}
 	protected override void OnStartRunning () {
 		Debug.Log("CustomEntityRendererSystem.OnStartRunning");
 
-		var input = SystemAPI.ManagedAPI.GetComponent<Input>(SystemHandle);
+		var input = SystemAPI.ManagedAPI.GetSingleton<Input>();
 
 		// TODO: comment how BatchRendererGroup ends up getting called by the engine, ie how dows unity know to 'call' my system
 		// Probably new BatchRendererGroup registers itself with the engine
@@ -154,7 +157,10 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		meshID = brg.RegisterMesh(input.mesh);
 		materialID = brg.RegisterMaterial(input.material);
 
-		query = new EntityQueryBuilder(Allocator.Temp).WithAll<CustomRenderAsset, LocalTransform>().Build(this);
+		instanceGraphicsBuffers = new UploadBuffer(3);
+		curInstanceGraphicsBuffer = null;
+
+		batchID = BatchID.Null;
 	}
 	protected override void OnStopRunning () {
 		Debug.Log("CustomEntityRendererSystem.OnStopRunning");
@@ -200,8 +206,9 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	}
 
 	int NumInstances;
-	JobHandle cullJobDep;
 	NativeArray<int> entityIndices;
+
+	EntityQuery query;
 
 	
 	static readonly ProfilerMarker perfAlloc  = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.ReallocateInstances");
@@ -255,22 +262,30 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		perfUpload.End();
 	}
 	
+	[BurstCompile]
 	protected override void OnUpdate () {
 		//Debug.Log($"CustomEntityRendererSystem.OnUpdate {NumInstances}");
 		
 		Remove(ref batchID);
 		DisposeOf(ref metadata);
 
+		query = GetEntityQuery(typeof(CustomRenderAsset), typeof(LocalTransform));
 		if (query.IsEmpty)
 			return;
+		
+		var controller = SystemAPI.GetSingleton<ControllerECS>();
 
 		NumInstances = query.CalculateEntityCount();
-		entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out cullJobDep);
+		entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out var entityIndexJob);
 		
 		ReallocateInstances();
 
-		ComputeInstanceDataJobHandle = new ComputeInstanceDataJob{ instanceData = instanceData }
-			.ScheduleParallel(query, Dependency);
+		ComputeInstanceDataJobHandle = new ComputeInstanceDataJob{
+			ChunkBaseEntityIndices = entityIndices,
+			LocalTransforms = GetComponentTypeHandle<LocalTransform>(true),
+			Controller = controller,
+			InstanceData = instanceData
+		}.ScheduleParallel(query, entityIndexJob);
 	}
 	
 	[BurstCompile]
@@ -305,12 +320,12 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 		var cullJob = new CullEntityInstancesJob {
 			ChunkBaseEntityIndices = entityIndices,
-			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true),
+			LocalTransformHandle = this.GetComponentTypeHandle<LocalTransform>(true), // TODO: Does this need update called?
 			chunkVisibilty = chunkVisibilty.AsParallelWriter(),
 			drawCommands = drawCommands,
 			CullingData = cullingData,
 			CullingViewType = cullingContext.viewType,
-		}.ScheduleParallel(query, cullJobDep);
+		}.ScheduleParallel(query, ComputeInstanceDataJobHandle);
 
 		var allocCmdsJob = new AllocDrawCommandsJob {
 			meshID = meshID, materialID = materialID, batchID = batchID, // Instead set up BatchCullingOutputDrawCommands inside here and only modify?
@@ -347,18 +362,150 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		return writeInstancesJob;
 	#endif
 	}
-	
+
 	// Could be optimized by only uploading if not culled, but since culling happens seperately for camera and shadows, this is non-trivial
 	// Possibly flag visible chunks and lather upload data if gpu instance data is not needed for culling/lod
 	// Actually this makes a lot of sense, since some the the data needed on gpu depends on LOD, like having only LOD0 be animated for example
 	[BurstCompile]
-	unsafe partial struct ComputeInstanceDataJob : IJobEntity {
+	unsafe partial struct ComputeInstanceDataJob : IJobChunk {
+		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
+		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransforms;
+		[ReadOnly] public ControllerECS Controller;
+
 		[NativeDisableUnsafePtrRestriction]
-		public InstanceDataBuffer instanceData;
-		
+		public InstanceDataBuffer InstanceData;
+
 		[BurstCompile]
-		unsafe void Execute ([EntityIndexInQuery] int idx, in LocalTransform transform) {
-			instanceData.from_transform(idx, transform);
+		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
+			
+			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransforms);
+
+			int BaseInstanceIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
+
+			for (int i=0; i<chunk.Count; i++) {
+				int idx = BaseInstanceIdx + i;
+				var transform = transforms[i];
+
+				InstanceData.from_transform(idx, transform);
+			}
+		}
+	}
+}
+
+//[UpdateInGroup(typeof(PresentationSystemGroup))]
+//[UpdateBefore(typeof(CustomEntityRendererSystem))]
+[UpdateInGroup(typeof(SimulationSystemGroup))]
+[UpdateAfter(typeof(SpinningSystem))]
+[BurstCompile]
+public partial struct UpdateSpatialGridSystem : ISystem {
+	
+	EntityQuery query;
+
+	EntityTypeHandle c_entities;
+	ComponentTypeHandle<LocalTransform> c_transformsRO;
+	SharedComponentTypeHandle<CustomEntitySpatialGrid> c_spatialGridRO;
+
+	[BurstCompile]
+	public void OnCreate (ref SystemState state) {
+		//query = state.GetEntityQuery(new EntityQueryBuilder(Allocator.Temp).WithAll<CustomRenderAsset, LocalTransform, CustomEntitySpatialGrid>());
+		query = state.GetEntityQuery(new EntityQueryBuilder(Allocator.Temp).WithAll<CustomRenderAsset, LocalTransform, CustomEntitySpatialGrid>());
+
+		c_entities = state.GetEntityTypeHandle();
+		c_transformsRO = state.GetComponentTypeHandle<LocalTransform>(true);
+		c_spatialGridRO = state.GetSharedComponentTypeHandle<CustomEntitySpatialGrid>();
+
+		state.RequireForUpdate<ControllerECS>();
+	}
+
+	[BurstCompile]
+	public void OnUpdate (ref SystemState state) {
+		var controller = SystemAPI.GetSingleton<ControllerECS>();
+
+		c_entities.Update(ref state);
+		c_transformsRO.Update(ref state);
+		c_spatialGridRO.Update(ref state);
+		
+		EntityCommandBuffer ecb;
+		if (controller.DebugSpatialGrid) ecb = new EntityCommandBuffer(Allocator.TempJob);
+		else                             ecb = SystemAPI.GetSingleton<BeginPresentationEntityCommandBufferSystem.Singleton>().CreateCommandBuffer(state.WorldUnmanaged);
+
+		var SpatialJob = new UpdateSpatialGridJob{
+			Entities = c_entities,
+			LocalTransforms = c_transformsRO,
+			SpatialGrid = c_spatialGridRO,
+			controller = controller,
+			Ecb = ecb.AsParallelWriter(),
+		}.ScheduleParallel(query, state.Dependency);
+
+		state.Dependency = SpatialJob;
+
+		if (controller.DebugSpatialGrid) {
+			SpatialJob.Complete();
+			ecb.Playback(state.EntityManager);
+			ecb.Dispose();
+
+			state.EntityManager.GetAllUniqueSharedComponents<CustomEntitySpatialGrid>(out var grid, Allocator.Temp);
+			foreach (var cell in grid) {
+				DebugGridCell(controller, cell);
+			}
+		}
+	}
+
+	void DebugGridCell (in ControllerECS controller, in CustomEntitySpatialGrid cell) {
+		float3 size = controller.ChunkGridSize;
+		float3 lower = (float3)cell.Key * size;
+
+		float3 a = lower + size * float3(0,0,0);
+		float3 b = lower + size * float3(1,0,0);
+		float3 c = lower + size * float3(1,1,0);
+		float3 d = lower + size * float3(0,1,0);
+		float3 e = lower + size * float3(0,0,1);
+		float3 f = lower + size * float3(1,0,1);
+		float3 g = lower + size * float3(1,1,1);
+		float3 h = lower + size * float3(0,1,1);
+
+		Color col = Color.blue;
+
+		Debug.DrawLine(a,b, col);
+		Debug.DrawLine(b,c, col);
+		Debug.DrawLine(c,d, col);
+		Debug.DrawLine(d,a, col);
+		Debug.DrawLine(e,f, col);
+		Debug.DrawLine(f,g, col);
+		Debug.DrawLine(g,h, col);
+		Debug.DrawLine(h,e, col);
+		Debug.DrawLine(a,e, col);
+		Debug.DrawLine(b,f, col);
+		Debug.DrawLine(c,g, col);
+		Debug.DrawLine(d,h, col);
+	}
+	
+	[BurstCompile]
+	unsafe partial struct UpdateSpatialGridJob : IJobChunk {
+		[ReadOnly] public EntityTypeHandle Entities;
+		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransforms;
+		[ReadOnly] public SharedComponentTypeHandle<CustomEntitySpatialGrid> SpatialGrid;
+		[ReadOnly] public ControllerECS controller;
+
+		public EntityCommandBuffer.ParallelWriter Ecb;
+
+		[BurstCompile]
+		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
+			
+			NativeArray<Entity> entities = chunk.GetNativeArray(Entities);
+			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransforms);
+			var curSpatialGrid = chunk.GetSharedComponent(SpatialGrid);
+
+			float3 gridMul = 1.0f / (float3)controller.ChunkGridSize;
+
+			// TODO: use ChunkEntityEnumerator everywhere?
+			for (int i=0; i<chunk.Count; i++) {
+				int3 spatialKey = (int3)floor(transforms[i].Position * gridMul);
+
+				if (any(spatialKey != curSpatialGrid.Key)) {
+					Ecb.SetSharedComponent(unfilteredChunkIndex, entities[i], new CustomEntitySpatialGrid { Key = spatialKey });
+				}
+			}
 		}
 	}
 }
