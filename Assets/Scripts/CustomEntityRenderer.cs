@@ -7,6 +7,7 @@ using Unity.Entities;
 using Unity.Jobs;
 using Unity.Mathematics;
 using static Unity.Mathematics.math;
+using float3x4 = Unity.Mathematics.float3x4;
 using float4x4 = Unity.Mathematics.float4x4;
 using quaternion = Unity.Mathematics.quaternion;
 
@@ -99,7 +100,6 @@ class UploadBuffer {
 
 [UpdateInGroup(typeof(PresentationSystemGroup))]
 [UpdateBefore(typeof(UpdatePresentationSystemGroup))]
-[BurstCompile]
 public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	
 	public class Input : IComponentData {
@@ -111,7 +111,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	BatchMeshID meshID = BatchMeshID.Null;
 	BatchMaterialID materialID = BatchMaterialID.Null;
 
-	//GraphicsBuffer instanceGraphicsBuffer = null;
 	UploadBuffer instanceGraphicsBuffers = new UploadBuffer(3);
 	GraphicsBuffer curInstanceGraphicsBuffer = null;
 
@@ -127,8 +126,14 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		public float3x4* obj2world;
 		public float3x4* world2obj;
 		public float4* color;
+		
+		public void from_transform (int idx, in LocalTransform transform) {
+			obj2world[idx] = pack_matrix(transform.ToMatrix());
+			world2obj[idx] = pack_matrix(transform.ToInverseMatrix());
+			color[idx] = (idx & 2) == 0 ? float4(1,0,0,1) : float4(0,1,0,1);
+		}
 	};
-	public InstanceDataBuffer instanceData { get; private set; }
+	InstanceDataBuffer instanceData;
 	
 	protected override void OnCreate () {
 		Debug.Log("CustomEntityRendererSystem.OnCreate");
@@ -157,7 +162,6 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		// Probably no need to remove batchID from brg
 		DisposeOf(ref brg);
 		DisposeOf(ref metadata);
-		//DisposeOf(ref instanceGraphicsBuffer);
 		instanceGraphicsBuffers.Dispose();
 		curInstanceGraphicsBuffer = null;
 	}
@@ -207,44 +211,34 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	public unsafe void ReallocateInstances () {
 		perfAlloc.Begin();
 		
-		//Debug.Log($"CustomEntityRenderer.ReallocateInstances() NumInstances: {NumInstances}");
+		int total_size = 64; // 64 bytes of zeroes, so loads from address 0 return zeroes
+		int offs0 = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_ObjectToWorld
+		int offs1 = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_WorldToObject
+		int offs2 = AddAligned(ref total_size, NumInstances * sizeof(float4), sizeof(float4)); // _BaseColor
 
-		//DisposeOf(ref instanceGraphicsBuffer); // TODO: Only if size changed?
-		DisposeOf(ref metadata);
+		//instanceGraphicsBuffer = new GraphicsBuffer(
+		//	GraphicsBuffer.Target.Raw,
+		//	GraphicsBuffer.UsageFlags.LockBufferForWrite,
+		//	total_size / sizeof(int), sizeof(int));
+		curInstanceGraphicsBuffer = instanceGraphicsBuffers.GetNext(
+			GraphicsBuffer.Target.Raw,
+			GraphicsBuffer.UsageFlags.LockBufferForWrite,
+			total_size / sizeof(int), sizeof(int));
 
-		instanceData = default;
+		NativeArray<int> write_buf = curInstanceGraphicsBuffer.LockBufferForWrite<int>(0, curInstanceGraphicsBuffer.count);
+		var ptr = (byte*)write_buf.GetUnsafePtr();
+		UnsafeUtility.MemSet(ptr, 0, 64);
 
-		if (NumInstances > 0) {
+		instanceData = new InstanceDataBuffer {
+			obj2world = (float3x4*)(ptr + offs0),
+			world2obj = (float3x4*)(ptr + offs1),
+			color = (float4*)(ptr + offs2),
+		};
 
-			int total_size = 64; // 64 bytes of zeroes, so loads from address 0 return zeroes
-			int offs0 = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_ObjectToWorld
-			int offs1 = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_WorldToObject
-			int offs2 = AddAligned(ref total_size, NumInstances * sizeof(float4), sizeof(float4)); // _BaseColor
-
-			//instanceGraphicsBuffer = new GraphicsBuffer(
-			//	GraphicsBuffer.Target.Raw,
-			//	GraphicsBuffer.UsageFlags.LockBufferForWrite,
-			//	total_size / sizeof(int), sizeof(int));
-			curInstanceGraphicsBuffer = instanceGraphicsBuffers.GetNext(
-				GraphicsBuffer.Target.Raw,
-				GraphicsBuffer.UsageFlags.LockBufferForWrite,
-				total_size / sizeof(int), sizeof(int));
-
-			NativeArray<int> write_buf = curInstanceGraphicsBuffer.LockBufferForWrite<int>(0, curInstanceGraphicsBuffer.count);
-			var ptr = (byte*)write_buf.GetUnsafePtr();
-			UnsafeUtility.MemSet(ptr, 0, 64);
-
-			instanceData = new InstanceDataBuffer {
-				obj2world = (float3x4*)(ptr + offs0),
-				world2obj = (float3x4*)(ptr + offs1),
-				color = (float4*)(ptr + offs2),
-			};
-
-			metadata = new NativeArray<MetadataValue>(3, Allocator.TempJob);
-			metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)offs0 };
-			metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)offs1 };
-			metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("_BaseColor"         ), Value = 0x80000000 | (uint)offs2 };
-		}
+		metadata = new NativeArray<MetadataValue>(3, Allocator.TempJob);
+		metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)offs0 };
+		metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)offs1 };
+		metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("_BaseColor"         ), Value = 0x80000000 | (uint)offs2 };
 
 		perfAlloc.End();
 	}
@@ -252,40 +246,31 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	public void ReuploadInstanceGraphicsBuffer () {
 		perfUpload.Begin();
 
-		Remove(ref batchID);
-
-		if (NumInstances > 0) {
-			curInstanceGraphicsBuffer.UnlockBufferAfterWrite<int>(curInstanceGraphicsBuffer.count);
+		curInstanceGraphicsBuffer.UnlockBufferAfterWrite<int>(curInstanceGraphicsBuffer.count);
 		
-			batchID = brg.AddBatch(metadata, curInstanceGraphicsBuffer.bufferHandle);
-			
-			curInstanceGraphicsBuffer = null; // Mark as used
-		}
+		batchID = brg.AddBatch(metadata, curInstanceGraphicsBuffer.bufferHandle);
+		
+		curInstanceGraphicsBuffer = null; // Mark as used
 
 		perfUpload.End();
 	}
 	
 	protected override void OnUpdate () {
-		NumInstances = query.CalculateEntityCount();
-
 		//Debug.Log($"CustomEntityRendererSystem.OnUpdate {NumInstances}");
+		
+		Remove(ref batchID);
+		DisposeOf(ref metadata);
+
+		if (query.IsEmpty)
+			return;
+
+		NumInstances = query.CalculateEntityCount();
+		entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out cullJobDep);
 		
 		ReallocateInstances();
 
-		ComputeInstanceDataJobHandle = new JobHandle(); // default for NumInstances==0 case
-
-		if (NumInstances > 0) {
-			entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out cullJobDep);
-
-			ComputeInstanceDataJobHandle = new ComputeInstanceDataJob{ instanceData = instanceData }
-				.ScheduleParallel(query, Dependency);
-
-			//instDataJob.Complete(); // Have to complete for ReuploadInstanceGraphicsBuffer!
-		}
-
-		//ReuploadInstanceGraphicsBuffer();
-
-		// TODO: defer instDataJob.Complete() + ReuploadInstanceGraphicsBuffer to OnPerformCulling because that runs potentially way later in the frame, and this we might hide wait
+		ComputeInstanceDataJobHandle = new ComputeInstanceDataJob{ instanceData = instanceData }
+			.ScheduleParallel(query, Dependency);
 	}
 	
 	[BurstCompile]
@@ -297,14 +282,14 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	#if UNITY_EDITOR
 		CustomEntityRenderer.inst.dbg.OnCulling(ref cullingContext);
 	#endif
+		
+		if (query.IsEmpty)
+			return new JobHandle();
 
 		if (curInstanceGraphicsBuffer != null) {
 			ComputeInstanceDataJobHandle.Complete();
 			ReuploadInstanceGraphicsBuffer();
 		}
-
-		if (NumInstances <= 0)
-			return new JobHandle();
 		
 		//Debug.Log($"CustomEntityRenderer.OnPerformCulling() NumInstances: {NumInstances}");
 
@@ -312,7 +297,7 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 
 	////
 		// Reuse Unity Culling Utils
-		var cullingData = CustomRendering.CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
+		var cullingData = CullingSplits.Create(&cullingContext, QualitySettings.shadowProjection, World.UpdateAllocator.Handle);
 		
 		int NumChunks = query.CalculateChunkCount();
 		var chunkVisibilty = new NativeList<ChunkVisiblity>(NumChunks, Allocator.TempJob);
@@ -363,6 +348,9 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 	#endif
 	}
 	
+	// Could be optimized by only uploading if not culled, but since culling happens seperately for camera and shadows, this is non-trivial
+	// Possibly flag visible chunks and lather upload data if gpu instance data is not needed for culling/lod
+	// Actually this makes a lot of sense, since some the the data needed on gpu depends on LOD, like having only LOD0 be animated for example
 	[BurstCompile]
 	unsafe partial struct ComputeInstanceDataJob : IJobEntity {
 		[NativeDisableUnsafePtrRestriction]
@@ -370,9 +358,7 @@ public unsafe partial class CustomEntityRendererSystem : SystemBase {
 		
 		[BurstCompile]
 		unsafe void Execute ([EntityIndexInQuery] int idx, in LocalTransform transform) {
-			instanceData.obj2world[idx] = pack_matrix(transform.ToMatrix());
-			instanceData.world2obj[idx] = pack_matrix(transform.ToInverseMatrix());
-			instanceData.color[idx] = (idx & 2) == 0 ? float4(1,0,0,1) : float4(0,1,0,1);
+			instanceData.from_transform(idx, transform);
 		}
 	}
 }

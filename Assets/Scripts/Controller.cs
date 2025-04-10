@@ -102,6 +102,7 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 		
 		// Cant do this inside Baker<Controller> for some reason, despite the fact that this is where the SpawnPrefab entity is created,
 		// apparently I could create a seperate script with its own baker which does this and add it to the prefab
+		
 		EntityManager.AddComponent<SpinningSystem.Tag>(c.SpawnPrefab);
 
 		////
@@ -153,21 +154,27 @@ public partial struct SpinningSystem : ISystem {
 	public void OnUpdate (ref SystemState state) {
 		new Job{ dt = SystemAPI.Time.DeltaTime }.ScheduleParallel();
 	}
+	
+	static float min_speed => radians(20);
+	static float max_speed => radians(360);
+	public static void SpinningForEntity (Entity entity, out float3 spin_axis, out float spin_speed) {
+		
+		var rand = new Unity.Mathematics.Random(hash(int2(entity.Index, entity.Version)));
 
-	[BurstCompile]
+		spin_axis = rand.NextFloat3Direction();
+		spin_speed = rand.NextFloat(min_speed, max_speed);
+	}
+
 	[WithAll(typeof(Tag))]
+	[BurstCompile]
 	public partial struct Job : IJobEntity {
 		public float dt;
-		float min_speed => radians(20);
-		float max_speed => radians(360);
 		
+		[BurstCompile]
 		void Execute (Entity entity, ref LocalTransform transform) {
-			var rand = new Unity.Mathematics.Random(hash(int2(entity.Index, entity.Version)));
+			SpinningForEntity(entity, out float3 spin_axis, out float spin_speeds);
 
-			var spin_axis = rand.NextFloat3Direction();
-			var speed = rand.NextFloat(min_speed, max_speed);
-
-			var rotation = Unity.Mathematics.quaternion.AxisAngle(spin_axis, speed * dt);
+			var rotation = Unity.Mathematics.quaternion.AxisAngle(spin_axis, spin_speeds * dt);
 			transform = transform.Rotate(rotation);
 		}
 	}

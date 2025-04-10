@@ -125,7 +125,7 @@ namespace CustomRendering {
 		}
 	}
 
-		[BurstCompile]
+	[BurstCompile]
 	unsafe partial struct CullEntityInstancesJob : IJobChunk {
 
 		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
@@ -294,6 +294,7 @@ namespace CustomRendering {
 		public NativeArray<BatchCullingOutputDrawCommands> cullingOutputCommands;
 		public NativeArray<DrawCommand> drawCommands;
 
+		[BurstCompile]
 		public void Execute () {
 			int drawCommandsCount = 0;
 			int visibleInstanceCount = 0;
@@ -371,7 +372,8 @@ namespace CustomRendering {
 		[ReadOnly] public NativeArray<DrawCommand> drawCommands;
 	
 		[ReadOnly] public NativeArray<BatchCullingOutputDrawCommands> cullingOutputCommands;
-
+		
+		[BurstCompile]
 		public void Execute (int index) {
 			var vis = chunkVisibilty[index];
 			int* outputInstances = cullingOutputCommands[0].visibleInstances;

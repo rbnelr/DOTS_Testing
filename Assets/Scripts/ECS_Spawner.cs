@@ -31,6 +31,7 @@ public partial struct SpawnerSystem : ISystem {
 		DestroyAll(ref state);
 	}
 	
+	[BurstCompile]
 	public void OnUpdate (ref SystemState state) {
 		//Debug.Log("SpawnerSystem.OnUpdate");
 		
@@ -57,12 +58,12 @@ public partial struct SpawnerSystem : ISystem {
 		perfSpawnAll.End();
 	}
 	
-	[BurstCompile]
 	[WithAll(typeof(LocalTransform))]
 	[WithNone(typeof(Parent))]
 	public partial struct InitJob : IJobEntity {
 		[ReadOnly] public ControllerECS ctrl;
 		
+		[BurstCompile]
 		void Execute ([EntityIndexInQuery] int idx, ref LocalTransform transform) {
 			int x = idx % ctrl.Tiling.x;
 			idx        /= ctrl.Tiling.x;
@@ -91,7 +92,8 @@ public partial struct SpawnerSystem : ISystem {
 	
 	[BurstCompile]
 	void DestroyAll (ref SystemState state) {
-		using (var entities = state.EntityManager.CreateEntityQuery(typeof(LocalTransform)).ToEntityArray(Allocator.Temp)) {
+		var query = new EntityQueryBuilder(Allocator.Temp).WithAll<LocalTransform>().Build(state.EntityManager);
+		using (var entities = query.ToEntityArray(Allocator.Temp)) {
 			state.EntityManager.DestroyEntity(entities);
 		}
 	}
