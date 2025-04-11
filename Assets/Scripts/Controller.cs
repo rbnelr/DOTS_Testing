@@ -76,7 +76,6 @@ public struct ControllerECS : IComponentData {
 }
 
 [UpdateInGroup(typeof(SimulationSystemGroup))]
-[RequireMatchingQueriesForUpdate]
 public unsafe partial class ControllerECSSystem : SystemBase {
 	
 	protected override void OnCreate () {
@@ -86,15 +85,15 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 	void Init () {
 		var c = SystemAPI.GetSingleton<ControllerECS>();
 
-		if (EntityManager.HasComponent<SpinningSystem.Tag>(c.SpawnPrefab)) {
-			EntityManager.AddComponent<SpinningSystem.Tag>(c.SpawnPrefab);
+		if (!EntityManager.HasComponent<SpinningSystem.Data>(c.SpawnPrefab)) {
+			EntityManager.AddComponent<SpinningSystem.Data>(c.SpawnPrefab);
 		}
 		
 		if (c.CustomSpawnPrefab == Entity.Null) {
 			var prefab = EntityManager.CreateEntity(
 				typeof(LocalTransform),
 				typeof(Prefab),
-				typeof(SpinningSystem.Tag),
+				typeof(SpinningSystem.Data),
 				typeof(CustomRenderAsset),
 				typeof(CustomEntitySpatialGrid)
 			);
@@ -109,6 +108,10 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 		}
 
 		SystemAPI.SetSingleton(c);
+	}
+	
+	protected override void OnStartRunning () {
+		Init();
 	}
 
 	protected override void OnUpdate () {
@@ -136,34 +139,50 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 [UpdateAfter(typeof(SpawnerSystem))]
 [BurstCompile]
 public partial struct SpinningSystem : ISystem {
-	public struct Tag : IComponentData {}
+	public struct Data : IComponentData {
+		public float3 BasePositon;
+		public Color Color;
+	}
 	
+	float time01;
+
+	[BurstCompile]
+	public void OnCreate (ref SystemState state) {
+		time01 = 0;
+	}
+
 	[BurstCompile]
 	public void OnUpdate (ref SystemState state) {
-		new Job{ dt = SystemAPI.Time.DeltaTime }.ScheduleParallel();
+		time01 += Time.deltaTime / 6;
+		time01 %= 1;
+
+		new Job{
+			dt = SystemAPI.Time.DeltaTime,
+			time01 = time01,
+		}.ScheduleParallel();
 	}
 	
 	static float min_speed => radians(20);
 	static float max_speed => radians(360);
-	public static void SpinningForEntity (Entity entity, out float3 spin_axis, out float spin_speed) {
-		
-		var rand = new Unity.Mathematics.Random(hash(int2(entity.Index, entity.Version)));
+	const float bob_height = 36.0f;
 
-		spin_axis = rand.NextFloat3Direction();
-		spin_speed = rand.NextFloat(min_speed, max_speed);
-	}
-
-	[WithAll(typeof(Tag))]
 	[BurstCompile]
 	public partial struct Job : IJobEntity {
 		public float dt;
+		public float time01;
 		
 		[BurstCompile]
-		void Execute (Entity entity, ref LocalTransform transform) {
-			SpinningForEntity(entity, out float3 spin_axis, out float spin_speeds);
+		void Execute (Entity entity, ref LocalTransform transform, in Data data) {
+			var rand = new Unity.Mathematics.Random(hash(int2(entity.Index, entity.Version)));
+			
+			var spin_axis = rand.NextFloat3Direction();
+			var spin_speed = rand.NextFloat(min_speed, max_speed);
+			var rotation = Unity.Mathematics.quaternion.AxisAngle(spin_axis, spin_speed * dt);
 
-			var rotation = Unity.Mathematics.quaternion.AxisAngle(spin_axis, spin_speeds * dt);
-			transform = transform.Rotate(rotation);
+			var pos = data.BasePositon;
+			pos.y += bob_height * noise.pnoise(pos / 200 + float3(time01,time01,0), float3(1, 1, 5));
+
+			transform = LocalTransform.FromPositionRotation(pos, mul(transform.Rotation, rotation));
 		}
 	}
 }

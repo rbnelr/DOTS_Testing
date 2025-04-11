@@ -57,15 +57,26 @@ public partial struct SpawnerSystem : ISystem {
 			SpawnAll(ref state, ctrl.ValueRO, SpawnEntity);
 		perfSpawnAll.End();
 	}
+
+	public static Color RandColor (uint hash) {
+		var rand = new Random(hash);
+		return Color.HSVToRGB(rand.NextFloat(), 1, 0.6f);
+	}
+	public static Color RandColor (Entity entity) {
+		return RandColor(hash(int2(entity.Index, entity.Version)));
+	}
+	public static Color RandColor (int3 cell) {
+		return RandColor(hash(cell));
+	}
 	
-	[WithAll(typeof(LocalTransform))]
+	[WithAll(typeof(LocalTransform), typeof(SpinningSystem.Data))]
 	[WithNone(typeof(Parent))]
 	[BurstCompile]
 	public partial struct InitJob : IJobEntity {
 		[ReadOnly] public ControllerECS ctrl;
 		
 		[BurstCompile]
-		void Execute ([EntityIndexInQuery] int idx, ref LocalTransform transform) {
+		void Execute ([EntityIndexInQuery] int idx, Entity entity, ref LocalTransform transform, ref SpinningSystem.Data spin_data) {
 			int x = idx % ctrl.Tiling.x;
 			idx        /= ctrl.Tiling.x;
 			int z = idx % ctrl.Tiling.y;
@@ -73,6 +84,8 @@ public partial struct SpawnerSystem : ISystem {
 			int y = idx;
 		
 			transform = LocalTransform.FromPosition(float3(x,1+y,z) * ctrl.Spacing);
+			spin_data.BasePositon = transform.Position;
+			spin_data.Color = RandColor(entity);
 		}
 	}
 

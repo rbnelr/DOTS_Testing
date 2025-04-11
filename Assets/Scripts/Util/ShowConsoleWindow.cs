@@ -40,11 +40,11 @@ public class ConsoleWindowUtil {
 	[return: MarshalAs(UnmanagedType.Bool)]
 	static extern bool AllocConsole ();
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool AttachConsole(int dwProcessId);
-	
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool FreeConsole();
+	[DllImport("kernel32.dll", SetLastError = true)]
+	static extern bool AttachConsole (int dwProcessId);
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	static extern bool FreeConsole ();
 
 	[DllImport("kernel32.dll", SetLastError = true)]
 	static extern bool SetStdHandle (int nStdHandle, IntPtr hHandle);
@@ -62,7 +62,7 @@ public class ConsoleWindowUtil {
 		uint dwFlagsAndAttributes,
 		IntPtr hTemplateFile
 	);
-	
+
 	const int SW_HIDE = 0;
 	const int SW_SHOW = 5;
 	const uint GENERIC_READ = 0x80000000;
@@ -78,16 +78,16 @@ public class ConsoleWindowUtil {
 		// Open existing console)
 		if (ShowWindow(GetConsoleWindow(), SW_SHOW))
 			return true;
-		
+
 		// or attach to parent process (if launched from cmd ; but if build and run from unity we don't get a console!
 		if (AttachToParentConsole && AttachConsole(-1))
 			return true;
-		
+
 		// or create console (if launched via double click)
 		return AllocConsole();
 	}
 
-	public static void Show (bool AttachToParentConsole=false) {
+	public static void Show (bool AttachToParentConsole = false) {
 		EnsureConsoleWindow(AttachToParentConsole);
 
 		// Attach console messages because these are broken for some reason
