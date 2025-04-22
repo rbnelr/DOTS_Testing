@@ -6,8 +6,8 @@ using static Unity.Mathematics.math;
 using Unity.Transforms;
 using Unity.Rendering;
 using System.Linq;
+using Unity.Collections;
 using Unity.Burst;
-using Unity.Scenes;
 
 public class Controller : MonoBehaviour {
 	public int Mode = 2;
@@ -26,6 +26,8 @@ public class Controller : MonoBehaviour {
 
 	public GameObject SpawnPrefab;
 
+	public bool Dynamic = false;
+
 	public bool DebugSpatialGrid = false;
 
 	class Baker : Baker<Controller> {
@@ -43,6 +45,7 @@ public class Controller : MonoBehaviour {
 				Spacing       = authoring.Spacing,
 				LODBias       = authoring.LODBias,
 				ChunkGridSize = authoring.ChunkGridSize,
+				Dynamic = authoring.Dynamic,
 				DebugSpatialGrid = authoring.DebugSpatialGrid,
 			});;
 		}
@@ -66,6 +69,8 @@ public struct ControllerECS : IComponentData {
 	public float LODBias;
 
 	public int3 ChunkGridSize;
+	
+	public bool Dynamic;
 
 	public bool DebugSpatialGrid;
 
@@ -76,36 +81,50 @@ public struct ControllerECS : IComponentData {
 }
 
 [UpdateInGroup(typeof(SimulationSystemGroup))]
+[BurstCompile]
 public unsafe partial class ControllerECSSystem : SystemBase {
 	
+	NativeList<Entity> spawnedEntities;
+
 	protected override void OnCreate () {
 		RequireForUpdate<ControllerECS>(); // Baked scene gets streamed in, so ControllerECS does not exist for a few frames
+
+		spawnedEntities = new NativeList<Entity>(1000, Allocator.Persistent);
+	}
+	protected override void OnDestroy () {
+		EntityManager.DestroyEntity(spawnedEntities.AsArray());
+		spawnedEntities.Dispose();
 	}
 
 	void Init () {
 		var c = SystemAPI.GetSingleton<ControllerECS>();
 
-		if (!EntityManager.HasComponent<SpinningSystem.Data>(c.SpawnPrefab)) {
-			EntityManager.AddComponent<SpinningSystem.Data>(c.SpawnPrefab);
+		if (!EntityManager.HasComponent<MyEntityData>(c.SpawnPrefab)) {
+			EntityManager.AddComponent<MyEntityData>(c.SpawnPrefab);
 		}
 		
 		if (c.CustomSpawnPrefab == Entity.Null) {
 			var prefab = EntityManager.CreateEntity(
 				typeof(LocalTransform),
 				typeof(Prefab),
-				typeof(SpinningSystem.Data),
-				typeof(CustomRenderAsset),
-				typeof(CustomEntitySpatialGrid)
+				typeof(MyEntityData),
+				typeof(CustomEntity.Asset),
+				typeof(CustomEntity.SpatialGrid)
 			);
 			
 			var rma = EntityManager.GetSharedComponentManaged<RenderMeshArray>(c.SpawnPrefab);
 			EntityManager.SetSharedComponentManaged(prefab,
-				new CustomRenderAsset(rma.MeshReferences[0], rma.MaterialReferences.Select(x => x.Value).ToArray()));
+				new CustomEntity.Asset(rma.MeshReferences[0], rma.MaterialReferences.Select(x => x.Value).ToArray()));
 
-			EntityManager.AddChunkComponentData<CustomEntityChunkBounds>(prefab);
+			EntityManager.SetSharedComponent(prefab, CustomEntity.SpatialGrid.Invalid);
+
+			EntityManager.AddChunkComponentData<CustomEntity.ChunkBounds>(prefab);
 
 			c.CustomSpawnPrefab = prefab;
 		}
+
+		ref var sys = ref EntityManager.WorldUnmanaged.GetExistingSystemState<DynamicEntityUpdateSystem>();
+		sys.Enabled = c.Dynamic;
 
 		SystemAPI.SetSingleton(c);
 	}
@@ -117,72 +136,69 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 	protected override void OnUpdate () {
 		Init();
 
-		var c = SystemAPI.GetSingletonRW<ControllerECS>();
+		var c = SystemAPI.GetSingleton<ControllerECS>();
 
-		char active0 = c.ValueRO.Mode == 0 ? '*':' ';
-		char active1 = c.ValueRO.Mode == 1 ? '*':' ';
-		char active2 = c.ValueRO.Mode == 2 ? '*':' ';
+		if (Keyboard.current.digit0Key.wasPressedThisFrame) c.SwitchMode(0);
+		if (Keyboard.current.digit1Key.wasPressedThisFrame) c.SwitchMode(1);
+		if (Keyboard.current.digit2Key.wasPressedThisFrame) c.SwitchMode(2);
+
+		if (Keyboard.current.gKey.wasPressedThisFrame) c.Dynamic = !c.Dynamic;
+
+		if (Keyboard.current.numpadPlusKey .isPressed) c.Ratio += 0.5f * SystemAPI.Time.DeltaTime;
+		if (Keyboard.current.numpadMinusKey.isPressed) c.Ratio -= 0.5f * SystemAPI.Time.DeltaTime;
+		c.Ratio = clamp(c.Ratio, 0.0f, 1.0f);
+
+		char active0 = c.Mode == 0 ? '*':' ';
+		char active1 = c.Mode == 1 ? '*':' ';
+		char active2 = c.Mode == 2 ? '*':' ';
+		var dyn = c.Dynamic ? "Dynamic":"Static";
 
 		DebugHUD.Show($"{active0}[0]: GameObjects {active1}[1]: ECS Unity Graphics {active2}[2]: ECS CustomRenderEntity");
+		DebugHUD.Show($" [G] {dyn} Entities");
+
+		DebugHUD.Show($" [+/-] Spawn {c.SpawnCount} Entities");
+
+		QualitySettings.lodBias = 2.0f * c.LODBias;
+
+		GO_Spawner.inst.enabled = c.Mode == 0;
+
+		//UpdateSpawnEntities(ref c);
+
+		SystemAPI.SetSingleton(c);
+	}
+
+	//[BurstCompile]
+	void UpdateSpawnEntities (ref ControllerECS c) {
+		if (spawnedEntities.Length < c.SpawnCount) {
+			const int MaxSpawnPerFrame = 500;
+
+			Entity SpawnEntity = c.Mode == 1 ? c.SpawnPrefab : c.CustomSpawnPrefab;
+
+			// bulk instantiate entities from prefabs
+			int count = math.min(c.SpawnCount - spawnedEntities.Length, MaxSpawnPerFrame);
+			//int count = c.SpawnCount - spawnedEntities.Length;
+			var newEntities = EntityManager.Instantiate(SpawnEntity, count, Allocator.Temp);
 		
-		if (Keyboard.current.digit0Key.wasPressedThisFrame) c.ValueRW.SwitchMode(0);
-		if (Keyboard.current.digit1Key.wasPressedThisFrame) c.ValueRW.SwitchMode(1);
-		if (Keyboard.current.digit2Key.wasPressedThisFrame) c.ValueRW.SwitchMode(2);
-
-		QualitySettings.lodBias = 2.0f * c.ValueRO.LODBias;
-
-		GO_Spawner.inst.enabled = c.ValueRO.Mode == 0;
-	}
-}
-
-[UpdateInGroup(typeof(SimulationSystemGroup))]
-[UpdateAfter(typeof(SpawnerSystem))]
-[BurstCompile]
-public partial struct SpinningSystem : ISystem {
-	public struct Data : IComponentData {
-		public float3 BasePositon;
-		public Color Color;
-	}
-	
-	float time01;
-
-	[BurstCompile]
-	public void OnCreate (ref SystemState state) {
-		time01 = 0;
-	}
-
-	[BurstCompile]
-	public void OnUpdate (ref SystemState state) {
-		time01 += Time.deltaTime / 6;
-		time01 %= 1;
-
-		new Job{
-			dt = SystemAPI.Time.DeltaTime,
-			time01 = time01,
-		}.ScheduleParallel();
-	}
-	
-	static float min_speed => radians(20);
-	static float max_speed => radians(360);
-	const float bob_height = 36.0f;
-
-	[BurstCompile]
-	public partial struct Job : IJobEntity {
-		public float dt;
-		public float time01;
+			// initialize entity positions via job
+			//new InitJob{ ctrl = ctrl }.ScheduleParallel();
 		
-		[BurstCompile]
-		void Execute (Entity entity, ref LocalTransform transform, in Data data) {
-			var rand = new Unity.Mathematics.Random(hash(int2(entity.Index, entity.Version)));
-			
-			var spin_axis = rand.NextFloat3Direction();
-			var spin_speed = rand.NextFloat(min_speed, max_speed);
-			var rotation = Unity.Mathematics.quaternion.AxisAngle(spin_axis, spin_speed * dt);
+			spawnedEntities.AddRange(newEntities);
+		
+			//newEntities.Dispose();
 
-			var pos = data.BasePositon;
-			pos.y += bob_height * noise.pnoise(pos / 200 + float3(time01,time01,0), float3(1, 1, 5));
-
-			transform = LocalTransform.FromPositionRotation(pos, mul(transform.Rotation, rotation));
+			Debug.Log($"{count} Entities Spawned => {spawnedEntities.Length}");
+		}
+		else if (spawnedEntities.Length > c.SpawnCount) {
+			int count = spawnedEntities.Length - c.SpawnCount;
+		
+			var toRemove = spawnedEntities.AsArray().GetSubArray(spawnedEntities.Length - count, count);
+		
+			EntityManager.DestroyEntity(toRemove);
+		
+			spawnedEntities.RemoveRange(spawnedEntities.Length - count, count);
+		}
+		else {
+			Debug.Log($"jhj");
 		}
 	}
 }

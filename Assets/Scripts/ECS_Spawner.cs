@@ -1,111 +1,197 @@
 using UnityEngine;
 using Unity.Mathematics;
 using static Unity.Mathematics.math;
-using Random = Unity.Mathematics.Random;
-using System.Linq;
-using Unity;
 using Unity.Entities;
 using Unity.Transforms;
 using Unity.Collections;
-using Unity.Jobs;
 using Unity.Burst;
-using Unity.Rendering;
 using Unity.Profiling;
-using Unity.Entities.Graphics;
+using Unity.Jobs;
 
+// TODO: Delete/Spawn only the difference in entity count, to proof on concept actually being able to init new entities
+// Instead of this being a system that knows when to spawn things, in practice numerous systems need to spawn things in different ways
+// I think the right way to solve this is to have a class/system for spawning (per type of entity to spawn)
+// Maybe we can say: VehicleSpawner.Get(), which returns something containing the ECB which can be passed into jobs
+// vehSpawn.SpawnAt(pos, ...) will then compute the init component data and create the entity using the ecb, which will later execute
 [UpdateInGroup(typeof(SimulationSystemGroup))]
 [UpdateAfter(typeof(ControllerECSSystem))]
 [RequireMatchingQueriesForUpdate]
 [BurstCompile]
 public partial struct SpawnerSystem : ISystem {
 	
-	static readonly ProfilerMarker perfDestroyAll = new ProfilerMarker("SpawnerSystem.DestroyAll");
-	static readonly ProfilerMarker perfSpawnAll  = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll");
-	static readonly ProfilerMarker perfSpawnAll1 = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.SpawnAll.Instantiate");
+	static readonly ProfilerMarker perfDestroy = new ProfilerMarker("SpawnerSystem.Destroy");
+	static readonly ProfilerMarker perfSpawn  = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.Spawn");
+	static readonly ProfilerMarker perfInit  = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.Init");
 	
+	EntityQuery query;
+
+	NativeList<Entity> spawnedEntities;
+	int spawned;
+
+	public void OnCreate (ref SystemState state) {
+		query = new EntityQueryBuilder(Allocator.Temp).WithAll<LocalTransform, MyEntityData>().Build(ref state);
+		spawnedEntities = new NativeList<Entity>(1000, Allocator.Persistent);
+		spawned = 0;
+	}
 	public void OnStartRunning (ref SystemState state) {
 		state.RequireForUpdate<ControllerECS>();
 	}
 	public void OnStopRunning (ref SystemState state) {
 		Debug.Log("SpawnerSystem.OnStopRunning");
 		DestroyAll(ref state);
+		spawnedEntities.Dispose();
 	}
 	
 	[BurstCompile]
 	public void OnUpdate (ref SystemState state) {
 		//Debug.Log("SpawnerSystem.OnUpdate");
 		
-		var ctrl = SystemAPI.GetSingletonRW<ControllerECS>();
-		if (!ctrl.ValueRO.Respawn)
-			return;
-
-		ctrl.ValueRW.Respawn = false;
-		
-		perfDestroyAll.Begin();
-		//using (Timer.Start(t => Debug.Log($"DestroyAll took {t*1000}ms")))
-			DestroyAll(ref state);
-		perfDestroyAll.End();
-		
-		ctrl = SystemAPI.GetSingletonRW<ControllerECS>();
-		if (ctrl.ValueRO.Mode <= 0)
-			return; // GameObjects will be spawned
-
-		Entity SpawnEntity = ctrl.ValueRW.Mode == 1 ? ctrl.ValueRO.SpawnPrefab : ctrl.ValueRO.CustomSpawnPrefab;
-
-		perfSpawnAll.Begin();
-		//using (Timer.Start(t => Debug.Log($"SpawnAll took {t*1000}ms")))
-			SpawnAll(ref state, ctrl.ValueRO, SpawnEntity);
-		perfSpawnAll.End();
+		var c = SystemAPI.GetSingleton<ControllerECS>();
+		UpdateSpawnEntities(ref state, c);
 	}
 
-	public static Color RandColor (uint hash) {
-		var rand = new Random(hash);
-		return Color.HSVToRGB(rand.NextFloat(), 1, 0.6f);
-	}
-	public static Color RandColor (Entity entity) {
-		return RandColor(hash(int2(entity.Index, entity.Version)));
-	}
-	public static Color RandColor (int3 cell) {
-		return RandColor(hash(cell));
+	[BurstCompile]
+	void DestroyAll (ref SystemState state) {
+		state.EntityManager.DestroyEntity(spawnedEntities.AsArray());
+		spawnedEntities.Clear();
 	}
 	
-	[WithAll(typeof(LocalTransform), typeof(SpinningSystem.Data))]
-	[WithNone(typeof(Parent))]
 	[BurstCompile]
-	public partial struct InitJob : IJobEntity {
+	void UpdateSpawnEntities (ref SystemState state, in ControllerECS c) {
+		if (c.SpawnCount > spawnedEntities.Length) {
+			Entity SpawnEntity = c.Mode == 1 ? c.SpawnPrefab : c.CustomSpawnPrefab;
+
+			const int MaxSpawnPerFrame = 1024;
+			int startIdx = spawnedEntities.Length;
+			int count = math.min(c.SpawnCount - spawnedEntities.Length, MaxSpawnPerFrame);
+			//int startIdx = spawned;
+			//int count = math.min(c.SpawnCount - spawned, MaxSpawnPerFrame);
+
+		#if true
+			// Single threaded, ~0.382ms
+			perfSpawn.Begin();
+			var newEntities = state.EntityManager.Instantiate(SpawnEntity, count, Allocator.Temp);
+			spawnedEntities.AddRange(newEntities);
+			perfSpawn.End();
+			
+			perfInit.Begin();
+			for (int idx=startIdx; idx<spawnedEntities.Length; idx++) {
+				var data = init_entity(idx, c);
+				
+				state.EntityManager.SetComponentData(spawnedEntities[idx], LocalTransform.FromPosition(data.BasePositon));
+				state.EntityManager.SetComponentData(spawnedEntities[idx], data);
+			}
+			perfInit.End();
+		#elif false
+			// Threaded with ECB, 0.366ms for job, 1.07ms for Playback
+			// also seemingly no way to get list of spawned entities
+			var ecb = new EntityCommandBuffer(Allocator.TempJob);
+
+			// initialize entity positions via job
+			var job = new SpawnJob{
+				ctrl = c,
+				SpawnEntity = SpawnEntity,
+				Ecb = ecb.AsParallelWriter(),
+				StartIndex = startIdx,
+			}.Schedule(count, 128, state.Dependency);
+
+			job.Complete();
+		perfSpawn.Begin();
+			ecb.Playback(state.EntityManager);
+			ecb.Dispose();
+
+			spawned += count;
+		perfSpawn.End();
+		#else
+			// Single threaded, ~0.382ms
+			perfSpawn.Begin();
+			var newEntities = state.EntityManager.Instantiate(SpawnEntity, count, Allocator.Temp);
+			spawnedEntities.AddRange(newEntities);
+			perfSpawn.End();
+			
+			var job = new InitJob{
+				ctrl = c,
+				SpawnEntity = SpawnEntity,
+				StartIndex = startIdx,
+				entities = spawnedEntities.AsArray(),
+				c_transform = state.GetComponentLookup<LocalTransform>(false),
+				c_data = state.GetComponentLookup<MyEntityData>(false),
+			}.Schedule(count, 128, state.Dependency);
+			
+			//job.Complete();
+			state.Dependency = job;
+		#endif
+			
+			Debug.Log($"{count} Entities Spawned => Count now {spawnedEntities.Length}");
+		}
+		else if (c.SpawnCount < spawnedEntities.Length) {
+		perfDestroy.Begin();
+
+			int count = spawnedEntities.Length - c.SpawnCount;
+			var toRemove = spawnedEntities.AsArray().GetSubArray(spawnedEntities.Length - count, count);
+		
+			state.EntityManager.DestroyEntity(toRemove);
+		
+			spawnedEntities.RemoveRange(spawnedEntities.Length - count, count);
+
+		perfDestroy.End();
+
+			Debug.Log($"{count} Entities Destroyed => Count now {spawnedEntities.Length}");
+		}
+	}
+	
+	static MyEntityData init_entity (int idx, in ControllerECS c) {
+		int i = idx;
+		int x = i % c.Tiling.x;
+		i        /= c.Tiling.x;
+		int z = i % c.Tiling.y;
+		i        /= c.Tiling.y;
+		int y = i;
+		
+		return new MyEntityData {
+			BasePositon = float3(x,1+y,z) * c.Spacing,
+			Color =  MyEntityData.RandColor(idx)
+		};
+	}
+
+	//[WithAll(typeof(LocalTransform), typeof(MyEntityData))]
+	//[WithNone(typeof(Parent))]
+	[BurstCompile]
+	public partial struct SpawnJob : IJobParallelFor {
 		[ReadOnly] public ControllerECS ctrl;
+		public Entity SpawnEntity;
+		public EntityCommandBuffer.ParallelWriter Ecb;
+		public int StartIndex;
 		
 		[BurstCompile]
-		void Execute ([EntityIndexInQuery] int idx, Entity entity, ref LocalTransform transform, ref SpinningSystem.Data spin_data) {
-			int x = idx % ctrl.Tiling.x;
-			idx        /= ctrl.Tiling.x;
-			int z = idx % ctrl.Tiling.y;
-			idx        /= ctrl.Tiling.y;
-			int y = idx;
-		
-			transform = LocalTransform.FromPosition(float3(x,1+y,z) * ctrl.Spacing);
-			spin_data.BasePositon = transform.Position;
-			spin_data.Color = RandColor(entity);
+		public void Execute (int idx) {
+			var entity = Ecb.Instantiate(0, SpawnEntity);
+			var data = init_entity(StartIndex + idx, ctrl);
+	
+			Ecb.SetComponent(0, entity, LocalTransform.FromPosition(data.BasePositon));
+			Ecb.SetComponent(0, entity, data);
 		}
 	}
 
 	[BurstCompile]
-	void SpawnAll (ref SystemState state, in ControllerECS ctrl, Entity SpawnEntity) {
-		// bulk instantiate entities from prefabs
-		perfSpawnAll1.Begin();
-		var entities = state.EntityManager.Instantiate(SpawnEntity, ctrl.SpawnCount, Allocator.Temp);
-		entities.Dispose();
-		perfSpawnAll1.End();
+	public partial struct InitJob : IJobParallelFor {
+		[ReadOnly] public ControllerECS ctrl;
+		public Entity SpawnEntity;
+		public int StartIndex;
 
-		// initialize entity positions via job
-		new InitJob{ ctrl = ctrl }.ScheduleParallel();
-	}
+		[ReadOnly] public NativeArray<Entity> entities;
+		[NativeDisableParallelForRestriction] // Not sure which safety check is affected here, just aliasing (writing to same entity from two threads) or also job dependecy?
+		public ComponentLookup<LocalTransform> c_transform;
+		[NativeDisableParallelForRestriction]
+		public ComponentLookup<MyEntityData> c_data;
+		
+		[BurstCompile]
+		public void Execute (int idx) {
+			var entity = entities[StartIndex + idx];
+			var data = init_entity(StartIndex + idx, ctrl);
 	
-	[BurstCompile]
-	void DestroyAll (ref SystemState state) {
-		var query = new EntityQueryBuilder(Allocator.Temp).WithAll<LocalTransform>().Build(state.EntityManager);
-		using (var entities = query.ToEntityArray(Allocator.Temp)) {
-			state.EntityManager.DestroyEntity(entities);
+			c_transform[entity] = LocalTransform.FromPosition(data.BasePositon);
+			c_data[entity] = data;
 		}
 	}
 }

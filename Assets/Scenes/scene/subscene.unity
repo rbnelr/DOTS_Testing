@@ -164,7 +164,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   Mode: 2
-  Ratio: 1
+  Ratio: 0.876
   Max: 100000
   Tiling:
     x: 100
@@ -172,11 +172,12 @@ MonoBehaviour:
   Spacing: 4
   LODBias: 1
   ChunkGridSize:
-    x: 16
-    y: 16
-    z: 16
+    x: 32
+    y: 32
+    z: 32
   SpawnPrefab: {fileID: 2129911693363614626, guid: bcb793f88f00f98429bd864c1dd12022, type: 3}
-  DebugSpatialGrid: 1
+  Dynamic: 1
+  DebugSpatialGrid: 0
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

@@ -29,7 +29,6 @@ using System.Collections.Generic;
 using System;
 using Unity.Transforms;
 using System.Threading;
-using CustomRendering;
 
 public static class CullingExtensions {
 	// We want to use UnsafeList to use RewindableAllocator, but PlanePacket APIs want NativeArrays
@@ -98,7 +97,7 @@ public static class CullingExtensions {
 
 }
 
-namespace CustomRendering {
+namespace CustomEntity {
 	
 	// Derived from Unity Entity Graphics rather than reused because it was internal
 
