@@ -60,6 +60,9 @@ public class CustomEntityRenderer : MonoBehaviour {
 	}
 }
 
+// TODO: actually use, but can't be used like this since this is managed, should simply turn Mesh+Material into registered BRG IDs
+// which then go to Asset components, this works as long as meshes or materials are not added at runtime
+// tracking meshes per entity is not really needed in practice I think
 [System.Serializable]
 public struct Asset : ISharedComponentData, IEquatable<Asset> {
 	public UnityObjectRef<Mesh> Mesh;
@@ -235,6 +238,7 @@ public unsafe partial class RendererSystem : SystemBase {
 	ComponentTypeHandle<LocalTransform> c_transformsRO;
 	ComponentTypeHandle<MyEntityData> c_dataRO;
 	SharedComponentTypeHandle<Asset> c_Asset;
+	ComponentTypeHandle<ChunkBounds> c_ChunkBounds;
 
 	protected override void OnCreate () {
 		Debug.Log("CustomEntityRendererSystem.OnCreate");
@@ -243,9 +247,10 @@ public unsafe partial class RendererSystem : SystemBase {
 		
 		query = new EntityQueryBuilder(Allocator.Temp).WithAll<Asset, LocalTransform, SpatialGrid, MyEntityData>().Build(this);
 
-		c_transformsRO = GetComponentTypeHandle<LocalTransform>(true);
-		c_dataRO = GetComponentTypeHandle<MyEntityData>(true);
+		c_transformsRO = GetComponentTypeHandle<LocalTransform>(isReadOnly: true);
+		c_dataRO = GetComponentTypeHandle<MyEntityData>(isReadOnly: true);
 		c_Asset = GetSharedComponentTypeHandle<Asset>();
+		c_ChunkBounds = GetComponentTypeHandle<ChunkBounds>(isReadOnly: true);
 
 		RequireForUpdate<ControllerECS>();
 	}
@@ -421,6 +426,7 @@ public unsafe partial class RendererSystem : SystemBase {
 			
 		c_transformsRO.Update(this);
 		c_Asset.Update(this);
+		c_ChunkBounds.Update(this);
 
 		if (curInstanceGraphicsBuffer != null) {
 			ComputeInstanceDataJobHandle.Complete();
@@ -444,6 +450,7 @@ public unsafe partial class RendererSystem : SystemBase {
 			ChunkBaseEntityIndices = entityIndices,
 			LocalTransformHandle = c_transformsRO,
 			AssetHandle = c_Asset,
+			ChunkBounds = c_ChunkBounds,
 			chunkVisibilty = chunkVisibilty.AsParallelWriter(),
 			drawCommands = drawCommands,
 			CullingData = cullingData,

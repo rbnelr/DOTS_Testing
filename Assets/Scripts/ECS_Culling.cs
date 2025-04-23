@@ -125,12 +125,14 @@ namespace CustomEntity {
 		}
 	}
 
+#if false
 	[BurstCompile]
 	unsafe partial struct CullEntityInstancesJob : IJobChunk {
 
 		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
 		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransformHandle;
 		[ReadOnly] public SharedComponentTypeHandle<Asset> AssetHandle;
+		[ReadOnly] public ComponentTypeHandle<ChunkBounds> ChunkBounds;
 
 		[ReadOnly] public CullingSplits CullingData;
 		[ReadOnly] public BatchCullingViewType CullingViewType;
@@ -182,13 +184,14 @@ namespace CustomEntity {
 					var split = splits[splitIndex];
 					var splitPlanes = CullingData.CombinedSplitAndReceiverPlanePackets.GetSubNativeArray(
 						split.CombinedPlanePacketOffset, split.CombinedPlanePacketCount);
+					var splitMask = (byte)(1 << splitIndex);
 
 					for (int i=0; i<chunk.Count; i++) {
 						AABB aabb = asset.CalcWorldBounds(transforms[i]);
 
 						bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
 						if (isVisible) {
-							vis.EntityVisible[i] |= (byte)(1 << splitIndex);
+							vis.EntityVisible[i] |= splitMask;
 						}
 					}
 				}
@@ -285,6 +288,117 @@ namespace CustomEntity {
 			}
 		}
 	}
+#else
+	// Per-Chunk Culling Only
+	[BurstCompile]
+	unsafe partial struct CullEntityInstancesJob : IJobChunk {
+
+		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
+		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransformHandle;
+		[ReadOnly] public SharedComponentTypeHandle<Asset> AssetHandle;
+		[ReadOnly] public ComponentTypeHandle<ChunkBounds> ChunkBounds;
+
+		[ReadOnly] public CullingSplits CullingData;
+		[ReadOnly] public BatchCullingViewType CullingViewType;
+
+		public NativeList<ChunkVisiblity>.ParallelWriter chunkVisibilty;
+		public NativeArray<DrawCommand> drawCommands;
+
+		unsafe struct SplitCounts {
+			public fixed int visibleCount[16];
+			public fixed int outputInstanceOffset[16];
+		}
+
+		// CullingSplits works like this:
+		// For camera: SplitPlanePackets contain presumably the 6 planes of the camera frustrum against which an AABB can be tested
+		//  however these are stored in a SIMD way that tests 4(?) Planes at once
+		// For BatchCullingViewType.Light (Directional shadows in my case):
+		//  CullingData.ReceiverPlanePackets:
+		//     I think contain the entire shadowmap volume (no splits)
+		//  CullingData.SplitAndReceiverPlanePackets(for split):
+		//     I think contain shadowmap volume split up with additional planes in attempt to cull away shadow cascades that instance does not touch
+		//  CullingData.ReceiverSphereCuller:
+		//     Seems to be a way to further cull instances because bigger shadow map cascades actually overlap smaller ones?
+		//     But this really confuses me
+
+		[BurstCompile]
+		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 enabledMaskIn) {
+			Assert.IsFalse(useEnabledMask);
+		
+			var transforms = chunk.GetNativeArray(ref LocalTransformHandle);
+			var chunkBounds = chunk.GetChunkComponentData(ref ChunkBounds);
+			
+			var asset = chunk.GetSharedComponent(AssetHandle);
+			if (!asset.Mesh.IsValid()) return;
+		
+			ChunkVisiblity vis;
+			vis.chunk = chunk;
+			vis.BaseInstanceIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
+
+			if (CullingViewType == BatchCullingViewType.Light) {
+				ref var splits = ref CullingData.Splits;
+				Assert.IsTrue(splits.Length <= 4);
+
+				byte chunkSplitVisible = 0;
+
+				for (int splitIndex = 0; splitIndex < splits.Length; ++splitIndex) {
+					var split = splits[splitIndex];
+					var splitPlanes = CullingData.CombinedSplitAndReceiverPlanePackets.GetSubNativeArray(
+						split.CombinedPlanePacketOffset, split.CombinedPlanePacketCount);
+					var splitMask = (byte)(1 << splitIndex);
+					
+					bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, chunkBounds.bounds)
+						!= FrustumPlanes.IntersectResult.Out;
+
+					if (isVisible) {
+						chunkSplitVisible |= splitMask;
+					}
+				}
+				
+				// TODO: optimize by using bitscan instructions to quickly skip culled entities,
+				// this is only relevant after first culling pass or if many entities are disabled beforehand (like invisible lod level)
+
+				// I don't understand what SphereTesting actually is for, but this mimics Entity.Graphics
+				if (CullingData.SphereTestEnabled) {
+					// Instances are culled either through CombinedSplitAndReceiverPlanePackets or later through SphereTest
+					if (chunkSplitVisible > 0) {
+						chunkSplitVisible &= (byte)CullingData.ReceiverSphereCuller.Cull(chunkBounds.bounds);
+					}
+				}
+				
+				if (chunkSplitVisible > 0) {
+					int offset = DrawCommand.AddInstances(ref drawCommands, chunkSplitVisible, chunk.Count);
+					
+					for (int i=0; i<chunk.Count; i++) {
+						vis.EntityVisible[i] = chunkSplitVisible;
+						vis.InstanceOffset[i] += i + offset;
+					}
+
+					chunkVisibilty.AddNoResize(vis);
+				}
+			}
+			else {
+				Assert.IsTrue(CullingData.Splits.Length == 1);
+
+				var splitPlanes = CullingData.SplitPlanePackets.AsNativeArray();
+			
+				bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, chunkBounds.bounds)
+					!= FrustumPlanes.IntersectResult.Out;
+
+				if (isVisible) {
+					int offset = DrawCommand.AddInstances(ref drawCommands, 1, chunk.Count);
+					
+					for (int i=0; i<chunk.Count; i++) {
+						vis.EntityVisible[i] = 1;
+						vis.InstanceOffset[i] += i + offset;
+					}
+
+					chunkVisibilty.AddNoResize(vis);
+				}
+			}
+		}
+	}
+#endif
 
 	[BurstCompile]
 	unsafe partial struct AllocDrawCommandsJob : IJob {
