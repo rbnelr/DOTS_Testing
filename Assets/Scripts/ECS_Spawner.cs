@@ -15,7 +15,7 @@ using Unity.Jobs;
 // vehSpawn.SpawnAt(pos, ...) will then compute the init component data and create the entity using the ecb, which will later execute
 [UpdateInGroup(typeof(SimulationSystemGroup))]
 [UpdateAfter(typeof(ControllerECSSystem))]
-[RequireMatchingQueriesForUpdate]
+[RequireMatchingQueriesForUpdate] // Does this actually affect ControllerECS / RequireForUpdate? I don't understand this
 [BurstCompile]
 public partial struct SpawnerSystem : ISystem {
 	
@@ -23,13 +23,13 @@ public partial struct SpawnerSystem : ISystem {
 	static readonly ProfilerMarker perfSpawn  = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.Spawn");
 	static readonly ProfilerMarker perfInit  = new ProfilerMarker(ProfilerCategory.Loading, "SpawnerSystem.Init");
 	
-	EntityQuery query;
+	//EntityQuery query;
 
 	NativeList<Entity> spawnedEntities;
 	int spawned;
 
 	public void OnCreate (ref SystemState state) {
-		query = new EntityQueryBuilder(Allocator.Temp).WithAll<LocalTransform, MyEntityData>().Build(ref state);
+		//query = new EntityQueryBuilder(Allocator.Temp).WithAll<LocalTransform, MyEntityData>().Build(ref state);
 		spawnedEntities = new NativeList<Entity>(1000, Allocator.Persistent);
 		spawned = 0;
 	}
@@ -58,30 +58,52 @@ public partial struct SpawnerSystem : ISystem {
 	
 	[BurstCompile]
 	void UpdateSpawnEntities (ref SystemState state, in ControllerECS c) {
-		if (c.SpawnCount > spawnedEntities.Length) {
-			Entity SpawnEntity = c.Mode == 1 ? c.SpawnPrefab : c.CustomSpawnPrefab;
+		Entity SpawnEntity = c.Mode == 1 ? c.SpawnPrefab : c.CustomSpawnPrefab;
 
-			const int MaxSpawnPerFrame = 1024;
+		if (c.SpawnCount > spawnedEntities.Length && SpawnEntity != Entity.Null) {
+
+			const int MaxSpawnPerFrame = 1024 * 4;
 			int startIdx = spawnedEntities.Length;
 			int count = math.min(c.SpawnCount - spawnedEntities.Length, MaxSpawnPerFrame);
 			//int startIdx = spawned;
 			//int count = math.min(c.SpawnCount - spawned, MaxSpawnPerFrame);
 
 		#if true
-			// Single threaded, ~0.382ms
-			perfSpawn.Begin();
+			// Single threaded
+			perfSpawn.Begin(); // 0.055ms
 			var newEntities = state.EntityManager.Instantiate(SpawnEntity, count, Allocator.Temp);
 			spawnedEntities.AddRange(newEntities);
 			perfSpawn.End();
 			
-			perfInit.Begin();
+			perfInit.Begin(); // 0.268ms
 			for (int idx=startIdx; idx<spawnedEntities.Length; idx++) {
+				var ent = spawnedEntities[idx];
 				var data = init_entity(idx, c);
 				
-				state.EntityManager.SetComponentData(spawnedEntities[idx], LocalTransform.FromPosition(data.BasePositon));
-				state.EntityManager.SetComponentData(spawnedEntities[idx], data);
+				var transf = LocalTransform.FromPosition(data.BasePositon);
+				state.EntityManager.SetComponentData(ent, transf);
+				state.EntityManager.SetComponentData(ent, data);
+				// TODO: faster to defer to UpdateSpatialGridSystem, or faster to spawn single entities with correct shared value instantly?
+				state.EntityManager.SetSharedComponent(ent, CustomEntity.SpatialGrid.ForTransform(c, transf));
 			}
 			perfInit.End();
+		#elif true
+			// Single threaded, non-bulk, slow
+			perfSpawn.Begin();
+			for (int i=0; i<count; i++) {
+				var ent = state.EntityManager.Instantiate(SpawnEntity);
+
+				var data = init_entity(startIdx + i, c);
+				var transf = LocalTransform.FromPosition(data.BasePositon);
+				
+				state.EntityManager.SetComponentData(ent, transf);
+				state.EntityManager.SetComponentData(ent, data);
+				// TODO: faster to defer to UpdateSpatialGridSystem, or faster to spawn single entities with correct shared value instantly?
+				state.EntityManager.SetSharedComponent(ent, CustomEntity.SpatialGrid.ForTransform(c, transf));
+				
+				spawnedEntities.Add(ent);
+			}
+			perfSpawn.End();
 		#elif false
 			// Threaded with ECB, 0.366ms for job, 1.07ms for Playback
 			// also seemingly no way to get list of spawned entities
@@ -103,26 +125,25 @@ public partial struct SpawnerSystem : ISystem {
 			spawned += count;
 		perfSpawn.End();
 		#else
-			// Single threaded, ~0.382ms
-			perfSpawn.Begin();
+			// Threaded Init using ComponentLookup
+			perfSpawn.Begin(); // 0.045ms
 			var newEntities = state.EntityManager.Instantiate(SpawnEntity, count, Allocator.Temp);
 			spawnedEntities.AddRange(newEntities);
 			perfSpawn.End();
-			
-			var job = new InitJob{
+
+			var job = new InitJob{ // >0.6ms per thread for some reason, there must be something wrong
 				ctrl = c,
-				SpawnEntity = SpawnEntity,
 				StartIndex = startIdx,
 				entities = spawnedEntities.AsArray(),
 				c_transform = state.GetComponentLookup<LocalTransform>(false),
 				c_data = state.GetComponentLookup<MyEntityData>(false),
-			}.Schedule(count, 128, state.Dependency);
+			}.Schedule(count, 64, state.Dependency);
 			
 			//job.Complete();
 			state.Dependency = job;
 		#endif
 			
-			Debug.Log($"{count} Entities Spawned => Count now {spawnedEntities.Length}");
+			//Debug.Log($"{count} Entities Spawned => Count now {spawnedEntities.Length}");
 		}
 		else if (c.SpawnCount < spawnedEntities.Length) {
 		perfDestroy.Begin();
@@ -136,7 +157,7 @@ public partial struct SpawnerSystem : ISystem {
 
 		perfDestroy.End();
 
-			Debug.Log($"{count} Entities Destroyed => Count now {spawnedEntities.Length}");
+			//Debug.Log($"{count} Entities Destroyed => Count now {spawnedEntities.Length}");
 		}
 	}
 	
@@ -176,7 +197,6 @@ public partial struct SpawnerSystem : ISystem {
 	[BurstCompile]
 	public partial struct InitJob : IJobParallelFor {
 		[ReadOnly] public ControllerECS ctrl;
-		public Entity SpawnEntity;
 		public int StartIndex;
 
 		[ReadOnly] public NativeArray<Entity> entities;

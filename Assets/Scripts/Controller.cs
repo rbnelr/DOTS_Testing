@@ -81,6 +81,7 @@ public struct ControllerECS : IComponentData {
 }
 
 [UpdateInGroup(typeof(SimulationSystemGroup))]
+[RequireMatchingQueriesForUpdate]
 [BurstCompile]
 public unsafe partial class ControllerECSSystem : SystemBase {
 	
@@ -99,11 +100,11 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 	void Init () {
 		var c = SystemAPI.GetSingleton<ControllerECS>();
 
-		if (!EntityManager.HasComponent<MyEntityData>(c.SpawnPrefab)) {
+		if (c.SpawnPrefab != Entity.Null && !EntityManager.HasComponent<MyEntityData>(c.SpawnPrefab)) {
 			EntityManager.AddComponent<MyEntityData>(c.SpawnPrefab);
 		}
 		
-		if (c.CustomSpawnPrefab == Entity.Null) {
+		if (c.SpawnPrefab != Entity.Null && c.CustomSpawnPrefab == Entity.Null) {
 			var prefab = EntityManager.CreateEntity(
 				typeof(LocalTransform),
 				typeof(Prefab),
@@ -113,14 +114,16 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 			);
 			
 			var rma = EntityManager.GetSharedComponentManaged<RenderMeshArray>(c.SpawnPrefab);
-			EntityManager.SetSharedComponentManaged(prefab,
-				new CustomEntity.Asset(rma.MeshReferences[0], rma.MaterialReferences.Select(x => x.Value).ToArray()));
+			if (rma.MeshReferences.Length > 0 && rma.MeshReferences[0].IsValid()) { // RenderMeshArray streamed in later?
+				EntityManager.SetSharedComponentManaged(prefab,
+					new CustomEntity.Asset(rma.MeshReferences[0], rma.MaterialReferences.Select(x => x.Value).ToArray()));
 
-			EntityManager.SetSharedComponent(prefab, CustomEntity.SpatialGrid.Invalid);
+				EntityManager.SetSharedComponent(prefab, CustomEntity.SpatialGrid.Invalid);
 
-			EntityManager.AddChunkComponentData<CustomEntity.ChunkBounds>(prefab);
+				EntityManager.AddChunkComponentData<CustomEntity.ChunkBounds>(prefab);
 
-			c.CustomSpawnPrefab = prefab;
+				c.CustomSpawnPrefab = prefab;
+			}
 		}
 
 		ref var sys = ref EntityManager.WorldUnmanaged.GetExistingSystemState<DynamicEntityUpdateSystem>();

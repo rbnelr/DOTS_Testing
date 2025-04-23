@@ -130,7 +130,7 @@ namespace CustomEntity {
 
 		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
 		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransformHandle;
-		//[ReadOnly] public SharedComponentTypeHandle<CustomRenderAsset> CustomRenderAssetHandle;
+		[ReadOnly] public SharedComponentTypeHandle<Asset> AssetHandle;
 
 		[ReadOnly] public CullingSplits CullingData;
 		[ReadOnly] public BatchCullingViewType CullingViewType;
@@ -160,7 +160,9 @@ namespace CustomEntity {
 			Assert.IsFalse(useEnabledMask);
 		
 			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransformHandle);
-			//var assetIdx = chunk.GetSharedComponentIndex(CustomRenderAssetHandle);
+			
+			var asset = chunk.GetSharedComponent(AssetHandle);
+			if (!asset.Mesh.IsValid()) return;
 		
 			ChunkVisiblity vis;
 			vis.chunk = chunk;
@@ -182,7 +184,7 @@ namespace CustomEntity {
 						split.CombinedPlanePacketOffset, split.CombinedPlanePacketCount);
 
 					for (int i=0; i<chunk.Count; i++) {
-						AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack, TODO: shared mesh asset AABB Transform with local transform, cache these AABB after a initial pass in the job?
+						AABB aabb = asset.CalcWorldBounds(transforms[i]);
 
 						bool isVisible = FrustumPlanes.Intersect2NoPartial(splitPlanes, aabb) != FrustumPlanes.IntersectResult.Out;
 						if (isVisible) {
@@ -200,7 +202,7 @@ namespace CustomEntity {
 					// Instances are culled either through CombinedSplitAndReceiverPlanePackets or later through SphereTest
 					for (int i=0; i<chunk.Count; i++) {
 						if (vis.EntityVisible[i] > 0) {
-							AABB aabb = new AABB { Center = transforms[i].Position, Extents = 1 }; // hack
+							AABB aabb = asset.CalcWorldBounds(transforms[i]); // cache from previous loop?
 						
 							int sphereSplitMask = CullingData.ReceiverSphereCuller.Cull(aabb);
 

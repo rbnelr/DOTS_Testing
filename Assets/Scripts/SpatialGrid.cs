@@ -21,6 +21,13 @@ public struct SpatialGrid : ISharedComponentData {
 
 	public static int3 InvalidKey = int.MinValue;
 	public static SpatialGrid Invalid => new SpatialGrid { Key = InvalidKey };
+
+	public static SpatialGrid ForTransform (in ControllerECS c, in LocalTransform transform) {
+		float3 gridMul = 1.0f / (float3)c.ChunkGridSize;
+
+		int3 spatialKey = (int3)floor(transform.Position * gridMul);
+		return new SpatialGrid { Key = spatialKey };
+	}
 }
 public struct ChunkBounds : IComponentData {
 	public AABB bounds;
@@ -31,25 +38,56 @@ public struct ChunkBounds : IComponentData {
 [BurstCompile]
 public partial struct UpdateSpatialGridSystem : ISystem {
 	
-	EntityQuery query;
+	EntityQuery movedQuery;
+	EntityQuery changedChunkQuery;
+	EntityQuery allChunkQuery;
 
 	EntityTypeHandle c_entities;
 	ComponentTypeHandle<LocalTransform> c_transformsRO;
+	ComponentTypeHandle<ChunkBounds> c_chunkBounds;
 	SharedComponentTypeHandle<SpatialGrid> c_spatialGridRO;
-		
+	SharedComponentTypeHandle<Asset> c_Asset;
+	
 	static readonly ProfilerMarker perf = new ProfilerMarker("UpdateSpatialGridSystem.Move");
 
 	public void OnCreate (ref SystemState state) {
-		query = new EntityQueryBuilder(Allocator.Temp).WithAll<Asset, LocalTransform, SpatialGrid>().Build(ref state);
+		movedQuery = new EntityQueryBuilder(Allocator.Temp)
+			.WithAll<Asset, LocalTransform, SpatialGrid>()
+			.WithAllChunkComponent<ChunkBounds>().Build(ref state);
 		//query.AddChangedVersionFilter(typeof(Asset)); // Not really needed since entities don't really need to be able to change their asset (just delete and create new entity at some position if really needed)
 		//query.AddChangedVersionFilter(typeof(LocalTransform));
-		query.SetChangedVersionFilter(typeof(LocalTransform));
+		movedQuery.SetChangedVersionFilter(typeof(LocalTransform));
+
+		changedChunkQuery = new EntityQueryBuilder(Allocator.Temp)
+			.WithAll<Asset, LocalTransform, SpatialGrid>()
+			.WithAllChunkComponent<ChunkBounds>().Build(ref state);
+		changedChunkQuery.SetOrderVersionFilter(); // Entity added to or removed from chunk, but not when chunk itself is removed
+		changedChunkQuery.SetChangedVersionFilter(typeof(LocalTransform));
+		
+		allChunkQuery = new EntityQueryBuilder(Allocator.Temp)
+			.WithAll<Asset, LocalTransform, SpatialGrid>()
+			.WithAllChunkComponent<ChunkBounds>().Build(ref state);
 
 		c_entities = state.GetEntityTypeHandle();
 		c_transformsRO = state.GetComponentTypeHandle<LocalTransform>(true);
+		c_chunkBounds = state.GetComponentTypeHandle<ChunkBounds>(false);
 		c_spatialGridRO = state.GetSharedComponentTypeHandle<SpatialGrid>();
+		c_Asset = state.GetSharedComponentTypeHandle<Asset>();
 
 		state.RequireForUpdate<ControllerECS>();
+	}
+
+	[BurstCompile]
+	partial struct DebugBoundsJob : IJobChunk {
+		[ReadOnly] public SharedComponentTypeHandle<SpatialGrid> SpatialGrid;
+		[ReadOnly] public ComponentTypeHandle<ChunkBounds> ChunkBounds;
+
+		[BurstCompile]
+		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
+			DebugChunkBounds(
+				chunk.GetChunkComponentData(ref ChunkBounds),
+				chunk.GetSharedComponent(SpatialGrid));
+		}
 	}
 
 	[BurstCompile]
@@ -58,19 +96,25 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 
 		// Show chunk outlines one frame delayed because it's easier to schedule while using BeginPresentationEntityCommandBufferSystem
 		if (controller.DebugSpatialGrid) {
-			state.EntityManager.GetAllUniqueSharedComponents<SpatialGrid>(out var grid, Allocator.Temp);
-			foreach (var cell in grid) {
-				DebugGridCell(controller, cell);
-			}
+			//state.EntityManager.GetAllUniqueSharedComponents<SpatialGrid>(out var grid, Allocator.Temp);
+			//foreach (var cell in grid) {
+			//	DebugGridCell(controller, cell);
+			//}
+			
+			c_spatialGridRO.Update(ref state);
+			c_chunkBounds.Update(ref state);
+			state.Dependency = new DebugBoundsJob{
+				SpatialGrid = c_spatialGridRO, ChunkBounds = c_chunkBounds
+			}.Schedule(allChunkQuery, state.Dependency);
 		}
 
-		if (query.IsEmpty) return;
+		if (movedQuery.IsEmpty) return;
 		
 		c_entities.Update(ref state);
 		c_transformsRO.Update(ref state);
 		c_spatialGridRO.Update(ref state);
-		
-		int NumEntities = query.CalculateEntityCount();
+
+		int NumMovedEntities = movedQuery.CalculateEntityCount();
 		
 		// Inspired by https://github.com/ITR13/DOTS-Particle-Life/blob/main/Assets/Scripts/SwapChunkSystem.cs
 		// I would prefer to only allocate memory for however many entities actually moved though
@@ -79,18 +123,18 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 		// this hash map is presumably unsafe if Add is called too often, but I could limit using a Interlocked.Add
 		// Alternatively we could push into a dynamically growing list (only possible with thread-local lists?)
 		// thread-local lists (or hashmaps) could quickly be processed in a separate IJob (iterate hashmap from each thread and apply chunk changes, or aggregate into single hashmap and do in order of chunk)
-		var movedEntities = new NativeParallelMultiHashMap<int3, Entity>(NumEntities, Allocator.TempJob);
+		var movedEntities = new NativeParallelMultiHashMap<int3, Entity>(NumMovedEntities, Allocator.TempJob);
 
 		var spatialJob = new UpdateSpatialGridJob{
 			Entities = c_entities,
 			LocalTransforms = c_transformsRO,
 			SpatialGrid = c_spatialGridRO,
-			LastSystemVersion = state.LastSystemVersion,
+			//LastSystemVersion = state.LastSystemVersion,
 			controller = controller,
 			//Ecb = ecb.AsParallelWriter(),
 			MovedEntities = movedEntities.AsParallelWriter(),
-		}.ScheduleParallel(query, state.Dependency);
-			
+		}.ScheduleParallel(movedQuery, state.Dependency);
+		
 		spatialJob.Complete();
 
 		perf.Begin();
@@ -109,30 +153,39 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 		}
 		perf.End();
 
-		if (controller.DebugSpatialGrid) {
-			Debug.Log($"UpdateSpatialGridSystem: Moved Entities: {movedEntities.Count()}");
-		}
-
 		movedEntities.Dispose(spatialJob);
-		state.Dependency = spatialJob;
+
+		////
+		c_transformsRO.Update(ref state);
+		c_chunkBounds.Update(ref state);
+		c_Asset.Update(ref state);
+		
+		int NumChangedChunks = changedChunkQuery.CalculateChunkCount();
+
+		var boundsJob = new UpdateChunkBoundsJob{
+			LocalTransforms = c_transformsRO,
+			ChunkBounds = c_chunkBounds,
+			AssetHandle = c_Asset,
+		}.ScheduleParallel(movedQuery, spatialJob);
+
+		state.Dependency = boundsJob;
 
 		//NativeTimer.test();
+
+		if (controller.DebugSpatialGrid) {
+			Debug.Log($"UpdateSpatialGridSystem: Chunk Moved Entities: {NumMovedEntities} Bounds Updated Chunks: {NumChangedChunks}");
+		}
 	}
 
-	void DebugGridCell (in ControllerECS controller, in SpatialGrid cell) {
-		float3 size = controller.ChunkGridSize;
-		float3 lower = (float3)cell.Key * size;
-
-		float3 a = lower + size * float3(0,0,0);
-		float3 b = lower + size * float3(1,0,0);
-		float3 c = lower + size * float3(1,1,0);
-		float3 d = lower + size * float3(0,1,0);
-		float3 e = lower + size * float3(0,0,1);
-		float3 f = lower + size * float3(1,0,1);
-		float3 g = lower + size * float3(1,1,1);
-		float3 h = lower + size * float3(0,1,1);
-
-		Color col = MyEntityData.RandColor(cell.Key);
+	static void DebugDrawWireCube (float3 lowerCorner, float3 size, Color col) {
+		float3 a = lowerCorner + size * float3(0,0,0);
+		float3 b = lowerCorner + size * float3(1,0,0);
+		float3 c = lowerCorner + size * float3(1,1,0);
+		float3 d = lowerCorner + size * float3(0,1,0);
+		float3 e = lowerCorner + size * float3(0,0,1);
+		float3 f = lowerCorner + size * float3(1,0,1);
+		float3 g = lowerCorner + size * float3(1,1,1);
+		float3 h = lowerCorner + size * float3(0,1,1);
 
 		Debug.DrawLine(a,b, col);
 		Debug.DrawLine(b,c, col);
@@ -147,6 +200,16 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 		Debug.DrawLine(c,g, col);
 		Debug.DrawLine(d,h, col);
 	}
+	static void DebugGridCell (in ControllerECS controller, in SpatialGrid cell) {
+		float3 size = controller.ChunkGridSize;
+		float3 lower = (float3)cell.Key * size;
+		DebugDrawWireCube(lower, size, MyEntityData.RandColor(cell.Key));
+	}
+	static void DebugChunkBounds (in ChunkBounds bounds, in SpatialGrid cell) {
+		float3 size = bounds.bounds.Extents*2;
+		float3 lower = bounds.bounds.Center - bounds.bounds.Extents;
+		DebugDrawWireCube(lower, size, MyEntityData.RandColor(cell.Key));
+	}
 		
 	public static int3 CalcGridCell (in ControllerECS controller, float3 cur_pos) {
 		float3 gridMul = 1.0f / (float3)controller.ChunkGridSize;
@@ -156,14 +219,16 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 		return spatialKey;
 	}
 
+	// Find which entities moven into which new chunks
+	// Can't be combined with per-chunk bounds computation, so likely should be merged with whatever job computes the final position of entity
 	[BurstCompile]
-	unsafe partial struct UpdateSpatialGridJob : IJobChunk {
+	partial struct UpdateSpatialGridJob : IJobChunk {
 		[ReadOnly] public EntityTypeHandle Entities;
 		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransforms;
 		[ReadOnly] public SharedComponentTypeHandle<SpatialGrid> SpatialGrid;
 		[ReadOnly] public ControllerECS controller;
 
-		public uint LastSystemVersion;
+		//public uint LastSystemVersion;
 
 		//public NativeArray<int> DebugCount;
 		//public EntityCommandBuffer.ParallelWriter Ecb;
@@ -190,6 +255,30 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 					//Interlocked.Add(ref ((int*)DebugCount.GetUnsafePtr())[0], 1);
 				}
 			}
+		}
+	}
+
+	[BurstCompile]
+	partial struct UpdateChunkBoundsJob : IJobChunk {
+		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransforms;
+		[ReadOnly] public SharedComponentTypeHandle<Asset> AssetHandle;
+		public ComponentTypeHandle<ChunkBounds> ChunkBounds;
+
+		[BurstCompile]
+		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
+			MinMaxAABB bounds = MinMaxAABB.Empty;
+			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransforms);
+			
+			var asset = chunk.GetSharedComponent(AssetHandle);
+			if (asset.Mesh.IsValid()) {
+
+				for (int i=0; i<chunk.Count; i++) {
+					var aabb = (MinMaxAABB)asset.CalcWorldBounds(transforms[i]);
+					bounds.Encapsulate(aabb);
+				}
+			}
+
+			chunk.SetChunkComponentData(ref ChunkBounds, new ChunkBounds{ bounds = bounds });
 		}
 	}
 }

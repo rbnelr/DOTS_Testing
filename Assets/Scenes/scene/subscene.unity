@@ -164,7 +164,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   Mode: 2
-  Ratio: 0.876
+  Ratio: 1
   Max: 100000
   Tiling:
     x: 100
@@ -177,7 +177,7 @@ MonoBehaviour:
     z: 32
   SpawnPrefab: {fileID: 2129911693363614626, guid: bcb793f88f00f98429bd864c1dd12022, type: 3}
   Dynamic: 1
-  DebugSpatialGrid: 0
+  DebugSpatialGrid: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

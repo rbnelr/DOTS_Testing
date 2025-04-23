@@ -60,21 +60,29 @@ public class CustomEntityRenderer : MonoBehaviour {
 	}
 }
 
+[System.Serializable]
 public struct Asset : ISharedComponentData, IEquatable<Asset> {
 	public UnityObjectRef<Mesh> Mesh;
-	public UnityObjectRef<Material>[] Materials;
+	//public UnityObjectRef<Material>[] Materials;
+	public UnityObjectRef<Material> Material;
 
 	public AABB RenderBoundsObj; // Do I need this? Or can my rendering simply access Mesh.Value.bounds.ToAABB()
 
 	// Memoize the expensive 128-bit hash
 	uint4 Hash128;
+	
+	public AABB CalcWorldBounds (in LocalTransform transform) {
+		//return new AABB { Center = transform.Position, Extents = 1 }; // TODO: actually transform bounds
+		return AABB.Transform(transform.ToMatrix(), RenderBoundsObj);
+	}
 
 	public Asset (Mesh mesh, Material[] materials) {
 		Mesh = mesh;
 
-		Materials = new UnityObjectRef<Material>[materials.Length];
-		for (int i = 0; i < materials.Length; i++)
-			Materials[i] = materials[i];
+		//Materials = new UnityObjectRef<Material>[materials.Length];
+		//for (int i = 0; i < materials.Length; i++)
+		//	Materials[i] = materials[i];
+		Material = materials[0];
 
 		RenderBoundsObj = Mesh.Value.bounds.ToAABB();
 
@@ -86,14 +94,15 @@ public struct Asset : ISharedComponentData, IEquatable<Asset> {
 	uint4 ComputeHash128 () {
 		var hash = new xxHash3.StreamingState(false);
 
-		int numMaterials = Materials?.Length ?? 0;
+		//int numMaterials = Materials?.Length ?? 0;
 
-		hash.Update(numMaterials);
+		//hash.Update(numMaterials);
 
 		AssetHash.UpdateAsset(ref hash, ref Mesh);
 
-		for (int i = 0; i < numMaterials; ++i)
-			AssetHash.UpdateAsset(ref hash, ref Materials[i]);
+		//for (int i = 0; i < numMaterials; ++i)
+		//	AssetHash.UpdateAsset(ref hash, ref Materials[i]);
+		AssetHash.UpdateAsset(ref hash, ref Material);
 
 		uint4 H = hash.DigestHash128();
 
@@ -225,6 +234,7 @@ public unsafe partial class RendererSystem : SystemBase {
 
 	ComponentTypeHandle<LocalTransform> c_transformsRO;
 	ComponentTypeHandle<MyEntityData> c_dataRO;
+	SharedComponentTypeHandle<Asset> c_Asset;
 
 	protected override void OnCreate () {
 		Debug.Log("CustomEntityRendererSystem.OnCreate");
@@ -235,6 +245,7 @@ public unsafe partial class RendererSystem : SystemBase {
 
 		c_transformsRO = GetComponentTypeHandle<LocalTransform>(true);
 		c_dataRO = GetComponentTypeHandle<MyEntityData>(true);
+		c_Asset = GetSharedComponentTypeHandle<Asset>();
 
 		RequireForUpdate<ControllerECS>();
 	}
@@ -380,6 +391,7 @@ public unsafe partial class RendererSystem : SystemBase {
 
 		c_transformsRO.Update(this);
 		c_dataRO.Update(this);
+		c_Asset.Update(this);
 
 		ComputeInstanceDataJobHandle.Complete();
 
@@ -408,11 +420,10 @@ public unsafe partial class RendererSystem : SystemBase {
 			return new JobHandle();
 			
 		c_transformsRO.Update(this);
-		//c_spinningData.Update(this);
+		c_Asset.Update(this);
 
 		if (curInstanceGraphicsBuffer != null) {
 			ComputeInstanceDataJobHandle.Complete();
-			//ComputeInstanceDataJobHandle = new JobHandle();
 
 			ReuploadInstanceGraphicsBuffer();
 		}
@@ -432,6 +443,7 @@ public unsafe partial class RendererSystem : SystemBase {
 		var cullJob = new CullEntityInstancesJob {
 			ChunkBaseEntityIndices = entityIndices,
 			LocalTransformHandle = c_transformsRO,
+			AssetHandle = c_Asset,
 			chunkVisibilty = chunkVisibilty.AsParallelWriter(),
 			drawCommands = drawCommands,
 			CullingData = cullingData,
