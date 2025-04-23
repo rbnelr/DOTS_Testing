@@ -38,9 +38,7 @@ public struct ChunkBounds : IComponentData {
 [BurstCompile]
 public partial struct UpdateSpatialGridSystem : ISystem {
 	
-	EntityQuery movedQuery;
-	EntityQuery changedChunkQuery;
-	EntityQuery allChunkQuery;
+	EntityQuery query;
 
 	EntityTypeHandle c_entities;
 	ComponentTypeHandle<LocalTransform> c_transformsRO;
@@ -51,20 +49,9 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 	static readonly ProfilerMarker perf = new ProfilerMarker("UpdateSpatialGridSystem.Move");
 
 	public void OnCreate (ref SystemState state) {
-		movedQuery = new EntityQueryBuilder(Allocator.Temp)
-			.WithAll<Asset, LocalTransform, SpatialGrid>()
-			.WithAllChunkComponent<ChunkBounds>().Build(ref state);
-		//query.AddChangedVersionFilter(typeof(Asset)); // Not really needed since entities don't really need to be able to change their asset (just delete and create new entity at some position if really needed)
-		//query.AddChangedVersionFilter(typeof(LocalTransform));
-		movedQuery.SetChangedVersionFilter(typeof(LocalTransform));
+		state.RequireForUpdate<ControllerECS>();
 
-		changedChunkQuery = new EntityQueryBuilder(Allocator.Temp)
-			.WithAll<Asset, LocalTransform, SpatialGrid>()
-			.WithAllChunkComponent<ChunkBounds>().Build(ref state);
-		changedChunkQuery.SetOrderVersionFilter(); // Entity added to or removed from chunk, but not when chunk itself is removed
-		changedChunkQuery.SetChangedVersionFilter(typeof(LocalTransform));
-		
-		allChunkQuery = new EntityQueryBuilder(Allocator.Temp)
+		query = new EntityQueryBuilder(Allocator.Temp)
 			.WithAll<Asset, LocalTransform, SpatialGrid>()
 			.WithAllChunkComponent<ChunkBounds>().Build(ref state);
 
@@ -73,15 +60,13 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 		c_chunkBounds = state.GetComponentTypeHandle<ChunkBounds>(false);
 		c_spatialGridRO = state.GetSharedComponentTypeHandle<SpatialGrid>();
 		c_Asset = state.GetSharedComponentTypeHandle<Asset>();
-
-		state.RequireForUpdate<ControllerECS>();
 	}
 
 	[BurstCompile]
 	partial struct DebugBoundsJob : IJobChunk {
 		[ReadOnly] public SharedComponentTypeHandle<SpatialGrid> SpatialGrid;
 		[ReadOnly] public ComponentTypeHandle<ChunkBounds> ChunkBounds;
-
+	
 		[BurstCompile]
 		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
 			DebugChunkBounds(
@@ -93,7 +78,7 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 	[BurstCompile]
 	public void OnUpdate (ref SystemState state) {
 		var controller = SystemAPI.GetSingleton<ControllerECS>();
-
+		
 		// Show chunk outlines one frame delayed because it's easier to schedule while using BeginPresentationEntityCommandBufferSystem
 		if (controller.DebugSpatialGrid) {
 			//state.EntityManager.GetAllUniqueSharedComponents<SpatialGrid>(out var grid, Allocator.Temp);
@@ -101,79 +86,95 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 			//	DebugGridCell(controller, cell);
 			//}
 			
+			query.ResetFilter();
+			Debug.Log($"DebugSpatialGrid: {query.CalculateChunkCount()}");
+			
 			c_spatialGridRO.Update(ref state);
 			c_chunkBounds.Update(ref state);
 			state.Dependency = new DebugBoundsJob{
 				SpatialGrid = c_spatialGridRO, ChunkBounds = c_chunkBounds
-			}.Schedule(allChunkQuery, state.Dependency);
+			}.Schedule(query, state.Dependency);
 		}
 
-		if (movedQuery.IsEmpty) return;
-		
-		c_entities.Update(ref state);
-		c_transformsRO.Update(ref state);
-		c_spatialGridRO.Update(ref state);
+		// Query Moved Entities
+		query.ResetFilter();
+		query.SetChangedVersionFilter(ComponentType.ReadOnly<LocalTransform>());
 
-		int NumMovedEntities = movedQuery.CalculateEntityCount();
-		
-		// Inspired by https://github.com/ITR13/DOTS-Particle-Life/blob/main/Assets/Scripts/SwapChunkSystem.cs
-		// I would prefer to only allocate memory for however many entities actually moved though
-		// Either we could somehow limit sorting to some number per frame and simply defer moves for any additional entities (increasing bounds) of chunks they were in
-		// which would probably be fine if memory size is tuned close to actual number of moved entities per frame (eg. usually 100 entities switch chunks per frame, but sometimes, like on loading 10000k entities change, if we allow for a 1000 sized buffer we can catch up)
-		// this hash map is presumably unsafe if Add is called too often, but I could limit using a Interlocked.Add
-		// Alternatively we could push into a dynamically growing list (only possible with thread-local lists?)
-		// thread-local lists (or hashmaps) could quickly be processed in a separate IJob (iterate hashmap from each thread and apply chunk changes, or aggregate into single hashmap and do in order of chunk)
-		var movedEntities = new NativeParallelMultiHashMap<int3, Entity>(NumMovedEntities, Allocator.TempJob);
+		int NumMovedEntities = 0;
+		int NumChunkSwapEntities = 0;
+		int NumChangedChunks = 0;
 
-		var spatialJob = new UpdateSpatialGridJob{
-			Entities = c_entities,
-			LocalTransforms = c_transformsRO,
-			SpatialGrid = c_spatialGridRO,
-			//LastSystemVersion = state.LastSystemVersion,
-			controller = controller,
-			//Ecb = ecb.AsParallelWriter(),
-			MovedEntities = movedEntities.AsParallelWriter(),
-		}.ScheduleParallel(movedQuery, state.Dependency);
-		
-		spatialJob.Complete();
+		if (!query.IsEmpty) {
+			c_entities.Update(ref state);
+			c_transformsRO.Update(ref state);
+			c_spatialGridRO.Update(ref state);
 
-		perf.Begin();
-		//var ecb = SystemAPI.GetSingleton<BeginPresentationEntityCommandBufferSystem.Singleton>().CreateCommandBuffer(state.WorldUnmanaged);
+			NumMovedEntities = query.CalculateEntityCount();
+		
+			// Inspired by https://github.com/ITR13/DOTS-Particle-Life/blob/main/Assets/Scripts/SwapChunkSystem.cs
+			// I would prefer to only allocate memory for however many entities actually moved though
+			// Either we could somehow limit sorting to some number per frame and simply defer moves for any additional entities (increasing bounds) of chunks they were in
+			// which would probably be fine if memory size is tuned close to actual number of moved entities per frame (eg. usually 100 entities switch chunks per frame, but sometimes, like on loading 10000k entities change, if we allow for a 1000 sized buffer we can catch up)
+			// this hash map is presumably unsafe if Add is called too often, but I could limit using a Interlocked.Add
+			// Alternatively we could push into a dynamically growing list (only possible with thread-local lists?)
+			// thread-local lists (or hashmaps) could quickly be processed in a separate IJob (iterate hashmap from each thread and apply chunk changes, or aggregate into single hashmap and do in order of chunk)
+			var movedEntities = new NativeParallelMultiHashMap<int3, Entity>(NumMovedEntities, Allocator.TempJob);
+
+			var spatialJob = new UpdateSpatialGridJob{
+				Entities = c_entities,
+				LocalTransforms = c_transformsRO,
+				SpatialGrid = c_spatialGridRO,
+				//LastSystemVersion = state.LastSystemVersion,
+				controller = controller,
+				//Ecb = ecb.AsParallelWriter(),
+				MovedEntities = movedEntities.AsParallelWriter(),
+			}.ScheduleParallel(query, state.Dependency);
+		
+			spatialJob.Complete();
+			state.Dependency = spatialJob;
+
+			perf.Begin();
+			//var ecb = SystemAPI.GetSingleton<BeginPresentationEntityCommandBufferSystem.Singleton>().CreateCommandBuffer(state.WorldUnmanaged);
 			
-		foreach (var key in movedEntities.GetKeyArray(Allocator.Temp)) {
-			int count = movedEntities.CountValuesForKey(key);
-			var values = new NativeArray<Entity>(count, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+			if (controller.DebugSpatialGrid) NumChunkSwapEntities = movedEntities.Count();
 
-			int i=0;
-			foreach (var val in movedEntities.GetValuesForKey(key)) {
-				values[i++] = val;
+			foreach (var key in movedEntities.GetKeyArray(Allocator.Temp)) {
+				int count = movedEntities.CountValuesForKey(key);
+				var values = new NativeArray<Entity>(count, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+
+				int i=0;
+				foreach (var val in movedEntities.GetValuesForKey(key)) {
+					values[i++] = val;
+				}
+
+				state.EntityManager.SetSharedComponent(values, new SpatialGrid { Key = key });
 			}
-
-			state.EntityManager.SetSharedComponent(values, new SpatialGrid { Key = key });
+			movedEntities.Dispose();
+			perf.End();
 		}
-		perf.End();
 
-		movedEntities.Dispose(spatialJob);
+		//
+		query.ResetFilter();
+		// Does this even work?, both moving entities inside a chunk and entities getting sorted into a chunk should trigger bound update
+		query.AddChangedVersionFilter(ComponentType.ReadOnly<LocalTransform>());
+		query.AddOrderVersionFilter(); // Entity added to or removed from chunk, but not when chunk itself is removed
 
-		////
-		c_transformsRO.Update(ref state);
-		c_chunkBounds.Update(ref state);
-		c_Asset.Update(ref state);
+		if (!query.IsEmpty) {
+			c_transformsRO.Update(ref state);
+			c_chunkBounds.Update(ref state);
+			c_Asset.Update(ref state);
 		
-		int NumChangedChunks = changedChunkQuery.CalculateChunkCount();
+			NumChangedChunks = query.CalculateChunkCount();
 
-		var boundsJob = new UpdateChunkBoundsJob{
-			LocalTransforms = c_transformsRO,
-			ChunkBounds = c_chunkBounds,
-			AssetHandle = c_Asset,
-		}.ScheduleParallel(movedQuery, spatialJob);
-
-		state.Dependency = boundsJob;
-
-		//NativeTimer.test();
+			state.Dependency = new UpdateChunkBoundsJob{
+				LocalTransforms = c_transformsRO,
+				ChunkBounds = c_chunkBounds,
+				AssetHandle = c_Asset,
+			}.ScheduleParallel(query, state.Dependency);
+		}
 
 		if (controller.DebugSpatialGrid) {
-			Debug.Log($"UpdateSpatialGridSystem: Chunk Moved Entities: {NumMovedEntities} Bounds Updated Chunks: {NumChangedChunks}");
+			Debug.Log($"UpdateSpatialGridSystem: Entities: {NumMovedEntities} Chunk Swaps: {NumChunkSwapEntities} Chunks Bounds Updated: {NumChangedChunks}");
 		}
 	}
 
@@ -186,7 +187,7 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 		float3 f = lowerCorner + size * float3(1,0,1);
 		float3 g = lowerCorner + size * float3(1,1,1);
 		float3 h = lowerCorner + size * float3(0,1,1);
-
+		
 		Debug.DrawLine(a,b, col);
 		Debug.DrawLine(b,c, col);
 		Debug.DrawLine(c,d, col);

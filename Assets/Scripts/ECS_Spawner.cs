@@ -170,7 +170,7 @@ public partial struct SpawnerSystem : ISystem {
 		int y = i;
 		
 		return new MyEntityData {
-			BasePositon = float3(x,1+y,z) * c.Spacing,
+			BasePositon = float3(x,5+y,z) * c.Spacing,
 			Color =  MyEntityData.RandColor(idx)
 		};
 	}
