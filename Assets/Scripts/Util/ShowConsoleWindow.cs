@@ -10,10 +10,12 @@ public class ShowConsoleWindow : MonoBehaviour {
 
 #if UNITY_STANDALONE_WIN
 	void Awake () {
-		Application.logMessageReceived += HandleLog;
+		if (enabled) {
+			Application.logMessageReceived += HandleLog;
 
-		if (ShowConsole)
-			ConsoleWindowUtil.Show();
+			if (ShowConsole)
+				ConsoleWindowUtil.Show();
+		}
 	}
 
 	void HandleLog (string logString, string stackTrace, LogType type) {

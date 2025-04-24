@@ -80,6 +80,7 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 		var controller = SystemAPI.GetSingleton<ControllerECS>();
 		
 		// Show chunk outlines one frame delayed because it's easier to schedule while using BeginPresentationEntityCommandBufferSystem
+	#if UNITY_EDITOR
 		if (controller.DebugSpatialGrid) {
 			//state.EntityManager.GetAllUniqueSharedComponents<SpatialGrid>(out var grid, Allocator.Temp);
 			//foreach (var cell in grid) {
@@ -95,6 +96,7 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 				SpatialGrid = c_spatialGridRO, ChunkBounds = c_chunkBounds
 			}.Schedule(query, state.Dependency);
 		}
+	#endif
 
 		// Query Moved Entities
 		query.ResetFilter();

@@ -8,6 +8,8 @@ using Unity.Rendering;
 using System.Linq;
 using Unity.Collections;
 using Unity.Burst;
+using System.Runtime.InteropServices;
+using Unity.Profiling;
 
 public class Controller : MonoBehaviour {
 	public int Mode = 2;
@@ -34,18 +36,16 @@ public class Controller : MonoBehaviour {
 		public override void Bake (Controller authoring) {
 			var entity = GetEntity(TransformUsageFlags.None);
 			AddComponent(entity, new ControllerECS {
-				Mode = authoring.Mode,
-				Respawn = true, // Respawn whenever inspector changes TODO: add way to change entity count in actual build?
 				SpawnPrefab = GetEntity(authoring.SpawnPrefab, TransformUsageFlags.Dynamic),
-				CustomSpawnPrefab = Entity.Null, // Create in ControllerECSSystem, as we can't really create custom entities here
 
-				Ratio         = authoring.Ratio  ,
-				Max           = authoring.Max    ,
-				Tiling        = authoring.Tiling ,
-				Spacing       = authoring.Spacing,
-				LODBias       = authoring.LODBias,
-				ChunkGridSize = authoring.ChunkGridSize,
-				Dynamic = authoring.Dynamic,
+				Mode             = authoring.Mode,
+				Ratio            = authoring.Ratio  ,
+				Max              = authoring.Max    ,
+				Tiling           = authoring.Tiling ,
+				Spacing          = authoring.Spacing,
+				LODBias          = authoring.LODBias,
+				ChunkGridSize    = authoring.ChunkGridSize,
+				Dynamic          = authoring.Dynamic,
 				DebugSpatialGrid = authoring.DebugSpatialGrid,
 			});;
 		}
@@ -54,10 +54,8 @@ public class Controller : MonoBehaviour {
 
 public struct ControllerECS : IComponentData {
 	public int Mode;
-	public bool Respawn;
 
 	public Entity SpawnPrefab;
-	public Entity CustomSpawnPrefab;
 	
 	public float Ratio;
 	public int Max;
@@ -70,41 +68,119 @@ public struct ControllerECS : IComponentData {
 
 	public int3 ChunkGridSize;
 	
+	[MarshalAs(UnmanagedType.U1)]
 	public bool Dynamic;
 
+	[MarshalAs(UnmanagedType.U1)]
 	public bool DebugSpatialGrid;
+}
 
-	public void SwitchMode (int Mode) {
-		this.Mode = Mode;
-		Respawn = true;
+// Only way to directly call Burst from managed via static class?
+[BurstCompile]
+public static class Spawner {
+	
+	static readonly ProfilerMarker perfDestroy  = new ProfilerMarker(ProfilerCategory.Loading, "Spawner.DestroyAll");
+	static readonly ProfilerMarker perfSpawn  = new ProfilerMarker(ProfilerCategory.Loading, "Spawner.UpdateSpawnEntities");
+
+	[BurstCompile]
+	public static void DestroyAll (in EntityManager em, ref NativeList<Entity> entities) {
+		perfDestroy.Begin();
+
+		em.DestroyEntity(entities.AsArray());
+		entities.Clear();
+
+		perfDestroy.End();
+	}
+	
+	[BurstCompile]
+	public static void UpdateSpawnEntities (in EntityManager em, ref NativeList<Entity> entities, in ControllerECS c, in Entity SpawnEntity) {
+		perfSpawn.Begin();
+
+		if (c.SpawnCount > entities.Length && SpawnEntity != Entity.Null) {
+
+			const int MaxSpawnPerFrame = 1024 * 4;
+			int startIdx = entities.Length;
+			int count = math.min(c.SpawnCount - entities.Length, MaxSpawnPerFrame);
+			//int startIdx = spawned;
+			//int count = math.min(c.SpawnCount - spawned, MaxSpawnPerFrame);
+
+			// Single threaded
+			var newEntities = em.Instantiate(SpawnEntity, count, Allocator.Temp);
+			entities.AddRange(newEntities);
+			
+			for (int idx=startIdx; idx<entities.Length; idx++) {
+				var ent = entities[idx];
+				var data = init_entity(idx, c);
+				
+				var transf = LocalTransform.FromPosition(data.BasePositon);
+				em.SetComponentData(ent, transf);
+				em.SetComponentData(ent, data);
+				//if (c.Mode == 2) {
+				//	// TODO: faster to defer to UpdateSpatialGridSystem, or faster to spawn single entities with correct shared value instantly?
+				//	em.SetSharedComponent(ent, CustomEntity.SpatialGrid.ForTransform(c, transf));
+				//}
+			}
+
+			//Debug.Log($"{count} Entities Spawned => Count now {spawnedEntities.Length}");
+		}
+		else if (c.SpawnCount < entities.Length) {
+
+			int count = entities.Length - c.SpawnCount;
+			var toRemove = entities.AsArray().GetSubArray(entities.Length - count, count);
+		
+			em.DestroyEntity(toRemove);
+		
+			entities.RemoveRange(entities.Length - count, count);
+
+			//Debug.Log($"{count} Entities Destroyed => Count now {spawnedEntities.Length}");
+		}
+
+		perfSpawn.End();
+	}
+	
+	public static MyEntityData init_entity (int idx, in ControllerECS c) {
+		int i = idx;
+		int x = i % c.Tiling.x;
+		i        /= c.Tiling.x;
+		int z = i % c.Tiling.y;
+		i        /= c.Tiling.y;
+		int y = i;
+		
+		return new MyEntityData {
+			BasePositon = float3(x,5+y,z) * c.Spacing,
+			Color =  MyEntityData.RandColor(idx)
+		};
 	}
 }
 
 [UpdateInGroup(typeof(SimulationSystemGroup))]
 [RequireMatchingQueriesForUpdate]
-[BurstCompile]
 public unsafe partial class ControllerECSSystem : SystemBase {
 	
-	NativeList<Entity> spawnedEntities;
+	Entity CustomSpawnPrefab; // not in ControllerECS as it resets when changed from inspector
+
+	NativeList<Entity> spawnEntities;
 
 	protected override void OnCreate () {
 		RequireForUpdate<ControllerECS>(); // Baked scene gets streamed in, so ControllerECS does not exist for a few frames
 
-		spawnedEntities = new NativeList<Entity>(1000, Allocator.Persistent);
+		spawnEntities = new NativeList<Entity>(1000, Allocator.Persistent);
 	}
 	protected override void OnDestroy () {
-		EntityManager.DestroyEntity(spawnedEntities.AsArray());
-		spawnedEntities.Dispose();
+		Spawner.DestroyAll(EntityManager, ref spawnEntities);
+		spawnEntities.Dispose();
 	}
 
 	void Init () {
 		var c = SystemAPI.GetSingleton<ControllerECS>();
 
 		if (c.SpawnPrefab != Entity.Null && !EntityManager.HasComponent<MyEntityData>(c.SpawnPrefab)) {
+			// Add MyEntityData so it can be moved just like custom entity (but still gets rendered using Entity.Graphics
+			// NOTE: color will not respect my random coloring
 			EntityManager.AddComponent<MyEntityData>(c.SpawnPrefab);
 		}
 		
-		if (c.SpawnPrefab != Entity.Null && c.CustomSpawnPrefab == Entity.Null) {
+		if (c.SpawnPrefab != Entity.Null && CustomSpawnPrefab == Entity.Null) {
 			var prefab = EntityManager.CreateEntity(
 				typeof(LocalTransform),
 				typeof(Prefab),
@@ -122,7 +198,7 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 
 				EntityManager.AddChunkComponentData<CustomEntity.ChunkBounds>(prefab);
 
-				c.CustomSpawnPrefab = prefab;
+				CustomSpawnPrefab = prefab;
 			}
 		}
 
@@ -135,15 +211,20 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 	protected override void OnStartRunning () {
 		Init();
 	}
+	
+	void SwitchMode (ref ControllerECS c, int Mode) {
+		c.Mode = Mode;
+		Spawner.DestroyAll(EntityManager, ref spawnEntities);
+	}
 
 	protected override void OnUpdate () {
 		Init();
 
 		var c = SystemAPI.GetSingleton<ControllerECS>();
 
-		if (Keyboard.current.digit0Key.wasPressedThisFrame) c.SwitchMode(0);
-		if (Keyboard.current.digit1Key.wasPressedThisFrame) c.SwitchMode(1);
-		if (Keyboard.current.digit2Key.wasPressedThisFrame) c.SwitchMode(2);
+		if (Keyboard.current.digit0Key.wasPressedThisFrame) SwitchMode(ref c, 0);
+		if (Keyboard.current.digit1Key.wasPressedThisFrame) SwitchMode(ref c, 1);
+		if (Keyboard.current.digit2Key.wasPressedThisFrame) SwitchMode(ref c, 2);
 
 		if (Keyboard.current.gKey.wasPressedThisFrame) c.Dynamic = !c.Dynamic;
 
@@ -165,43 +246,10 @@ public unsafe partial class ControllerECSSystem : SystemBase {
 
 		GO_Spawner.inst.enabled = c.Mode == 0;
 
-		//UpdateSpawnEntities(ref c);
+		Entity SpawnEntity = c.Mode == 1 ? c.SpawnPrefab : CustomSpawnPrefab;
+		Spawner.UpdateSpawnEntities(EntityManager, ref spawnEntities, c, SpawnEntity);
 
 		SystemAPI.SetSingleton(c);
 	}
 
-	//[BurstCompile]
-	void UpdateSpawnEntities (ref ControllerECS c) {
-		if (spawnedEntities.Length < c.SpawnCount) {
-			const int MaxSpawnPerFrame = 500;
-
-			Entity SpawnEntity = c.Mode == 1 ? c.SpawnPrefab : c.CustomSpawnPrefab;
-
-			// bulk instantiate entities from prefabs
-			int count = math.min(c.SpawnCount - spawnedEntities.Length, MaxSpawnPerFrame);
-			//int count = c.SpawnCount - spawnedEntities.Length;
-			var newEntities = EntityManager.Instantiate(SpawnEntity, count, Allocator.Temp);
-		
-			// initialize entity positions via job
-			//new InitJob{ ctrl = ctrl }.ScheduleParallel();
-		
-			spawnedEntities.AddRange(newEntities);
-		
-			//newEntities.Dispose();
-
-			Debug.Log($"{count} Entities Spawned => {spawnedEntities.Length}");
-		}
-		else if (spawnedEntities.Length > c.SpawnCount) {
-			int count = spawnedEntities.Length - c.SpawnCount;
-		
-			var toRemove = spawnedEntities.AsArray().GetSubArray(spawnedEntities.Length - count, count);
-		
-			EntityManager.DestroyEntity(toRemove);
-		
-			spawnedEntities.RemoveRange(spawnedEntities.Length - count, count);
-		}
-		else {
-			Debug.Log($"jhj");
-		}
-	}
 }

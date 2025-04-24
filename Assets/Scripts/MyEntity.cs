@@ -28,8 +28,7 @@ public struct MyEntityData : IComponentData {
 
 
 [UpdateInGroup(typeof(SimulationSystemGroup))]
-//[UpdateAfter(typeof(ControllerECSSystem))]
-[UpdateAfter(typeof(SpawnerSystem))]
+[UpdateAfter(typeof(ControllerECSSystem))]
 [BurstCompile]
 public partial struct DynamicEntityUpdateSystem : ISystem {
 	
