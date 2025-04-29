@@ -19,7 +19,8 @@ using Unity.Transforms;
 using Unity.Profiling;
 using Unity.Burst.Intrinsics;
 using System.Threading;
-
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 
 namespace CustomEntity {
 
@@ -152,52 +153,212 @@ namespace CustomEntity {
 		}
 	}
 
-	// Seems to work fine most of the time to use a single GraphicsBuffer (Dispose old one, allocate new one and upload)
-	// But sometimes rarely for some reason unity gives a warning about GraphicsBuffer still being in flight
-	class UploadBuffer {
-		GraphicsBuffer[] bufs;
-		int next;
+	public struct InstanceData {
+		
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public static float3x4 LocalTransform2float3x4 (in LocalTransform t)
+		{
+			float3x3 r = float3x3(t.Rotation);
+			return float3x4(r.c0 * t.Scale,
+			                r.c1 * t.Scale,
+			                r.c2 * t.Scale,
+			                t.Position);
+		}
 
-		public UploadBuffer (int frames) {
-			bufs = new GraphicsBuffer[frames];
-			next = 0;
+		static int alignup (int byte_offset, int alignment) {
+			return (byte_offset + alignment - 1) / alignment * alignment;
+		}
+		static int AddAligned (ref int cur_offset, int size, int alignment) {
+			cur_offset = alignup(cur_offset, alignment);
+			int offset = cur_offset;
+			cur_offset += size;
+			return offset;
+		}
+
+		public unsafe struct BufferLayout {
+			public int total_size;
+
+			public int offs_obj2world;
+			public int offs_world2obj;
+			public int offs_color;
+
+			public BufferLayout (int NumInstances) {
+				total_size = 64; // 64 bytes of zeroes, so loads from address 0 return zeroes
+				offs_obj2world = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_ObjectToWorld
+				offs_world2obj = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_WorldToObject
+				offs_color     = AddAligned(ref total_size, NumInstances * sizeof(float4), sizeof(float4)); // _BaseColor
+
+				total_size = alignup(total_size, 4); // GraphicsBuffer must be 4 byte aligned
+
+				Debug.Log($"GPU BufferLayout: NumInstances: {NumInstances} -> total_size: {total_size / 1024/1204} MB");
+			}
+			
+			public NativeArray<MetadataValue> GetMetadata () {
+				var metadata = new NativeArray<MetadataValue>(3, Allocator.Temp);
+				metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)offs_obj2world };
+				metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)offs_world2obj };
+				metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("_BaseColor"), Value = 0x80000000 | (uint)offs_color };
+				return metadata;
+			}
+		}
+
+
+		public struct Batch {
+			public GraphicsBuffer buf;
+			public SparseUploader upload;
+			public BufferLayout layout;
+			public BatchID batchID;
+
+			public int InstanceCount;
+			public int ChunkCount;
+
+			ThreadedSparseUploader tsu;
+
+			public struct ThreadedUpload {
+				ThreadedSparseUploader tsu;
+				BufferLayout layout;
+
+				public ThreadedUpload (ThreadedSparseUploader tsu, BufferLayout layout) {
+					this.tsu = tsu;
+					this.layout = layout;
+				}
+				
+				[MethodImpl(MethodImplOptions.AggressiveInlining)]
+				public unsafe void WriteTransform (float3x4* obj2world, int baseIndex, int count) {
+					tsu.AddMatrixUploadAndInverse(obj2world, count,
+						layout.offs_obj2world + baseIndex*sizeof(float3x4),
+						layout.offs_world2obj + baseIndex*sizeof(float3x4),
+						ThreadedSparseUploader.MatrixType.MatrixType3x4, ThreadedSparseUploader.MatrixType.MatrixType3x4);
+				}
+				[MethodImpl(MethodImplOptions.AggressiveInlining)]
+				public unsafe void WriteColor (float4* color, int baseIndex, int count) {
+					tsu.AddUpload(color, count*sizeof(float4), layout.offs_color + baseIndex*sizeof(float4));
+				}
+
+			}
+
+			public Batch (ref BatchRendererGroup brg, int instanceCount, int chunkCount) {
+				layout = new BufferLayout(instanceCount);
+				buf = new GraphicsBuffer(GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.None, layout.total_size/4, 4);
+				upload = new SparseUploader(buf);
+
+				InstanceCount = instanceCount;
+				ChunkCount = chunkCount;
+
+				batchID = brg.AddBatch(layout.GetMetadata(), buf.bufferHandle);
+			}
+			public void Dispose (ref BatchRendererGroup brg) {
+				if (InstanceCount > 0) {
+					brg.RemoveBatch(batchID);
+					upload.Dispose();
+					buf.Dispose();
+					InstanceCount = 0;
+				}
+			}
+
+			public unsafe ThreadedUpload BeginUpload () {
+				//Debug.Log("BeginUpload");
+
+				tsu = upload.Begin(
+					maxDataSizeInBytes: (sizeof(float3x4) + sizeof(float4)) * InstanceCount,
+					biggestDataUpload: sizeof(float3x4) * 128, // float3x4 * Max Instances per Chunk
+					maxOperationCount: 2 * ChunkCount);
+				return new ThreadedUpload(tsu, layout);
+			}
+			public void EndUpload () {
+				//Debug.Log("EndUpload");
+
+				upload.EndAndCommit(tsu);
+				upload.FrameCleanup();
+				tsu = default;
+			}
+		}
+
+		
+		#if false
+		//HashSet<GpuMemoryBlock> blocks;
+		//Dictionary<int, List<Block>> freelist;
+
+		// Temp solution: One block per chunk
+		Dictionary<ArchetypeChunk, GpuMemoryBlock> chunkBlocks;
+
+		public InstanceData () {
+			chunkBlocks = new Dictionary<ArchetypeChunk, GpuMemoryBlock>(32);
 		}
 		public void Dispose () {
-			for (int i = 0; i < bufs.Length; i++) {
-				if (bufs[i] != null) {
-					bufs[i].Dispose();
-					bufs[i] = null;
-				}
+			foreach (var b in chunkBlocks.Values) {
+				b.Dispose();
 			}
+			chunkBlocks.Clear();
 		}
 
-		public GraphicsBuffer GetNext (GraphicsBuffer.Target target, GraphicsBuffer.UsageFlags usage, int count, int stride) {
-			ref var buf = ref bufs[next++];
-			next = next % bufs.Length;
+		public void UpdateGpuAllocation (in EntityQuery query) {
+			var chunks = query.ToArchetypeChunkArray(Allocator.Temp);
 
-			//if (buf != null)
-			//	buf.Dispose();
-			//buf = new GraphicsBuffer(target, usage, count, stride);
+			foreach (var chunk in chunks) {
+				if (!chunkBlocks.ContainsKey(chunk)) {
+					var block = new GpuMemoryBlock(new BlockLayout(chunk.Capacity));
+					chunkBlocks.Add(chunk, block);
 
-			// This avoids visible stalls (waiting for render thread) in Vulkan, not tested if fps gain in d3d
-			// But probably indicates that I need to use different method to upload data as I can't completely avoid ever allocating new GraphicsBuffer
-			// reuse existing buffer if size did not change
-			if (buf == null || buf.count != count) {
-				if (buf != null) {
-					buf.Dispose();
-					buf = null;
+					Debug.Log($"New Chunk");
 				}
-				// avoid allocing buffer if not actually uploading anything (but still free old buffer)
-				if (count > 0)
-					buf = new GraphicsBuffer(target, usage, count, stride);
 			}
-			return buf;
+			
+			var deletedChunks = new NativeList<ArchetypeChunk>(0, Allocator.Temp);
+			
+			Debug.Log($"New Count: {chunkBlocks.Count}");
+
+			// None of these are working for some reason
+			foreach (var chunk in chunkBlocks.Keys) {
+				if (chunk.Invalid()) {
+					Debug.Log("Chunk Null");
+					deletedChunks.Add(chunk);
+				}
+				if (chunk == ArchetypeChunk.Null) {
+					Debug.Log("Chunk Null");
+					deletedChunks.Add(chunk);
+				}
+				if (chunk.Count == 0) {
+					Debug.Log("chunk.Count == 0");
+					deletedChunks.Add(chunk);
+				}
+			}
+
+			foreach (var chunk in deletedChunks) {
+				chunkBlocks[chunk].Dispose();
+				chunkBlocks.Remove(chunk);
+			}
+
+			deletedChunks.Dispose();
+			chunks.Dispose();
 		}
+		#else
+		public Batch batch;
+
+		public void Dispose (ref BatchRendererGroup brg) {
+			batch.Dispose(ref brg);
+		}
+
+		public void UpdateGpuAllocation (ref BatchRendererGroup brg, in EntityQuery query) {
+			//Debug.Log("UpdateGpuAllocation");
+
+			var instanceCount = query.CalculateEntityCountWithoutFiltering();
+
+			if (instanceCount > batch.InstanceCount) {
+				Debug.Log($"Resize InstanceData {batch.InstanceCount} -> {instanceCount}");
+
+				batch.Dispose(ref brg);
+				
+				var chunkCount = query.CalculateEntityCountWithoutFiltering();
+				batch = new Batch(ref brg, instanceCount, chunkCount);
+			}
+		}
+		#endif
 	}
 
 	[UpdateInGroup(typeof(PresentationSystemGroup))]
 	[UpdateBefore(typeof(UpdatePresentationSystemGroup))]
-	[BurstCompile]
+	//[BurstCompile]
 	public unsafe partial class RendererSystem : SystemBase {
 
 		public class Input : IComponentData {
@@ -209,29 +370,10 @@ namespace CustomEntity {
 		BatchMeshID meshID;
 		BatchMaterialID materialID;
 
-		UploadBuffer instanceGraphicsBuffers;
-		GraphicsBuffer curInstanceGraphicsBuffer;
-
-		NativeArray<MetadataValue> metadata;
-		BatchID batchID;
-
 		JobHandle ComputeInstanceDataJobHandle;
+		bool NeedEndComputeInstanceData;
 
-		public unsafe struct InstanceDataBuffer {
-			// Pointers into instanceGraphicsBuffer which is locked for writing
-			public float3x4* obj2world;
-			public float3x4* world2obj;
-			public float4* color;
-
-			public static InstanceDataBuffer Null => new InstanceDataBuffer { obj2world = null, world2obj = null, color = null };
-
-			public void from_transform (int idx, in LocalTransform transform, in Color col) {
-				obj2world[idx] = pack_matrix(transform.ToMatrix());
-				world2obj[idx] = pack_matrix(transform.ToInverseMatrix());
-				color[idx] = float4(col.r, col.g, col.b, col.a);//(idx & 2) == 0 ? float4(1,0,0,1) : float4(0,1,0,1);
-			}
-		};
-		InstanceDataBuffer instanceData;
+		InstanceData instanceData;
 
 		EntityQuery query;
 
@@ -268,128 +410,37 @@ namespace CustomEntity {
 			meshID = brg.RegisterMesh(input.mesh);
 			materialID = brg.RegisterMaterial(input.material);
 
-			instanceGraphicsBuffers = new UploadBuffer(3);
-			curInstanceGraphicsBuffer = null;
-
-			batchID = BatchID.Null;
+			instanceData = new InstanceData();
 		}
 		protected override void OnStopRunning () {
 			Debug.Log("CustomEntityRendererSystem.OnStopRunning");
 
 			// Probably no need to remove batchID from brg
-			DisposeOf(ref brg);
-			DisposeOf(ref metadata);
-			instanceGraphicsBuffers.Dispose();
-			curInstanceGraphicsBuffer = null;
+			instanceData.Dispose(ref brg);
+			brg.Dispose();
 		}
 
-		static void DisposeOf<T> (ref T obj) where T : IDisposable {
-			if (obj != null) {
-				obj.Dispose();
-				obj = default(T);
-			}
-		}
-		static void DisposeOf<T> (ref NativeArray<T> obj) where T : struct {
-			if (obj.IsCreated) {
-				obj.Dispose();
-			}
-		}
-		void Remove (ref BatchID obj) {
-			if (obj != null) {
-				brg.RemoveBatch(obj);
-				obj = BatchID.Null;
-			}
-		}
-
-		public static float3x4 pack_matrix (float4x4 mat) {
-			return new float3x4(
-				mat.c0.xyz, mat.c1.xyz, mat.c2.xyz, mat.c3.xyz
-			);
-		}
-		static int alignup (int byte_offset, int alignment) {
-			return (byte_offset + alignment - 1) / alignment * alignment;
-		}
-		static int AddAligned (ref int cur_offset, int size, int alignment) {
-			cur_offset = alignup(cur_offset, alignment);
-			int offset = cur_offset;
-			cur_offset += size;
-			return offset;
-		}
-
-		int NumInstances;
 		NativeArray<int> entityIndices;
 
-		static readonly ProfilerMarker perfAlloc = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.ReallocateInstances");
 		static readonly ProfilerMarker perfUpload = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.ReuploadInstanceGraphicsBuffer");
 		static readonly ProfilerMarker perfCmd = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.OnPerformCulling");
 
-		public unsafe void ReallocateInstances () {
-			if (NumInstances <= 0) {
-				instanceGraphicsBuffers.GetNext(
-					GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.LockBufferForWrite,
-					0, sizeof(int));
-				instanceData = InstanceDataBuffer.Null;
-				return;
-			}
-
-			perfAlloc.Begin();
-
-			int total_size = 64; // 64 bytes of zeroes, so loads from address 0 return zeroes
-			int offs0 = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_ObjectToWorld
-			int offs1 = AddAligned(ref total_size, NumInstances * sizeof(float3x4), sizeof(float3x4)); // unity_WorldToObject
-			int offs2 = AddAligned(ref total_size, NumInstances * sizeof(float4), sizeof(float4)); // _BaseColor
-
-			//instanceGraphicsBuffer = new GraphicsBuffer(
-			//	GraphicsBuffer.Target.Raw,
-			//	GraphicsBuffer.UsageFlags.LockBufferForWrite,
-			//	total_size / sizeof(int), sizeof(int));
-			curInstanceGraphicsBuffer = instanceGraphicsBuffers.GetNext(
-				GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.LockBufferForWrite,
-				total_size / sizeof(int), sizeof(int));
-
-			NativeArray<int> write_buf = curInstanceGraphicsBuffer.LockBufferForWrite<int>(0, curInstanceGraphicsBuffer.count);
-			var ptr = (byte*)write_buf.GetUnsafePtr();
-			UnsafeUtility.MemSet(ptr, 0, 64);
-
-			instanceData = new InstanceDataBuffer {
-				obj2world = (float3x4*)(ptr + offs0),
-				world2obj = (float3x4*)(ptr + offs1),
-				color = (float4*)(ptr + offs2),
-			};
-
-			metadata = new NativeArray<MetadataValue>(3, Allocator.TempJob);
-			metadata[0] = new MetadataValue { NameID = Shader.PropertyToID("unity_ObjectToWorld"), Value = 0x80000000 | (uint)offs0 };
-			metadata[1] = new MetadataValue { NameID = Shader.PropertyToID("unity_WorldToObject"), Value = 0x80000000 | (uint)offs1 };
-			metadata[2] = new MetadataValue { NameID = Shader.PropertyToID("_BaseColor"), Value = 0x80000000 | (uint)offs2 };
-
-			perfAlloc.End();
-		}
-
-		public void ReuploadInstanceGraphicsBuffer () {
-			perfUpload.Begin();
-
-			curInstanceGraphicsBuffer.UnlockBufferAfterWrite<int>(curInstanceGraphicsBuffer.count);
-
-			batchID = brg.AddBatch(metadata, curInstanceGraphicsBuffer.bufferHandle);
-
-			curInstanceGraphicsBuffer = null; // Mark as used
-
-			perfUpload.End();
-		}
-
-		[BurstCompile]
+		//[BurstCompile]
 		protected override void OnUpdate () {
-			//Debug.Log($"CustomEntityRendererSystem.OnUpdate {NumInstances}");
+			//Debug.Log($"CustomEntityRendererSystem.OnUpdate");
 
-			Remove(ref batchID);
-			DisposeOf(ref metadata);
-
-			NumInstances = query.CalculateEntityCount();
-			ReallocateInstances();
+			instanceData.UpdateGpuAllocation(ref brg, query);
+			
+			ComputeInstanceDataJobHandle = new JobHandle();
+			NeedEndComputeInstanceData = false;
 
 			if (query.IsEmpty)
 				return;
 
+			UploadInstanceData();
+		}
+		
+		void UploadInstanceData () {
 			var controller = SystemAPI.GetSingleton<ControllerECS>();
 
 			entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out var entityIndexJob);
@@ -398,20 +449,27 @@ namespace CustomEntity {
 			c_dataRO.Update(this);
 			c_Asset.Update(this);
 
-			ComputeInstanceDataJobHandle.Complete();
+			var upload = instanceData.batch.BeginUpload();
 
 			ComputeInstanceDataJobHandle = new ComputeInstanceDataJob {
 				ChunkBaseEntityIndices = entityIndices,
 				LocalTransforms = c_transformsRO,
 				Data = c_dataRO,
 				Controller = controller,
-				InstanceData = instanceData
+				Upload = upload,
+				LastSystemVersion = LastSystemVersion,
 			}.ScheduleParallel(query, entityIndexJob);
+			
+			ComputeInstanceDataJobHandle.Complete();
+			instanceData.batch.EndUpload();
+			NeedEndComputeInstanceData = false;
 
-			Dependency = ComputeInstanceDataJobHandle; // For some reason this is needed, is this right? We want to explictly only finish this job later in OnPerformCulling
+			// For some reason this is needed, is this right? We want to explictly only finish this job later in OnPerformCulling
+			// I guess so that other jobs which might modify the relevant components for the instance data correctly wait (even though they should never be modified in practice or our rendering is broken)
+			Dependency = ComputeInstanceDataJobHandle;
 		}
 
-		[BurstCompile]
+		//[BurstCompile]
 		unsafe JobHandle OnPerformCulling (
 				BatchRendererGroup rendererGroup,
 				BatchCullingContext cullingContext,
@@ -420,6 +478,14 @@ namespace CustomEntity {
 #if UNITY_EDITOR
 			CustomEntityRenderer.inst.dbg.OnCulling(ref cullingContext);
 #endif
+			//Debug.Log("OnPerformCulling");
+
+			//if (NeedEndComputeInstanceData) {
+			//	ComputeInstanceDataJobHandle.Complete();
+			//
+			//	instanceData.batch.EndUpload();
+			//	NeedEndComputeInstanceData = false;
+			//}
 
 			if (query.IsEmpty)
 				return new JobHandle();
@@ -427,12 +493,6 @@ namespace CustomEntity {
 			c_transformsRO.Update(this);
 			c_Asset.Update(this);
 			c_ChunkBounds.Update(this);
-
-			if (curInstanceGraphicsBuffer != null) {
-				ComputeInstanceDataJobHandle.Complete();
-
-				ReuploadInstanceGraphicsBuffer();
-			}
 
 			//Debug.Log($"CustomEntityRenderer.OnPerformCulling() NumInstances: {NumInstances}");
 
@@ -460,7 +520,7 @@ namespace CustomEntity {
 			var allocCmdsJob = new AllocDrawCommandsJob {
 				meshID = meshID,
 				materialID = materialID,
-				batchID = batchID, // Instead set up BatchCullingOutputDrawCommands inside here and only modify?
+				batchID = instanceData.batch.batchID, // Instead set up BatchCullingOutputDrawCommands inside here and only modify?
 				cullingOutputCommands = cullingOutput.drawCommands,
 				drawCommands = drawCommands,
 			}.Schedule(cullJob);
@@ -471,28 +531,11 @@ namespace CustomEntity {
 				cullingOutputCommands = cullingOutput.drawCommands,
 			}.Schedule(chunkVisibilty, 8, allocCmdsJob);
 
-#if false
-		// Complete for testing
-		writeInstancesJob.Complete();
-		
-		Debug.Log($"-------------");
-		for (int splitMask=0; splitMask<16; ++splitMask) {
-			if (drawCommands[splitMask].visibleInstances > 0)
-				Debug.Log($"Cmd {Convert.ToString(splitMask, 2)}: Visible Instances: {drawCommands[splitMask].visibleInstances}");
-		}
-		
-		chunkVisibilty.Dispose(writeInstancesJob);
-		drawCommands.Dispose(writeInstancesJob);
-
-		perfCmd.End();
-		return new JobHandle();
-#else
 			chunkVisibilty.Dispose(writeInstancesJob);
 			drawCommands.Dispose(writeInstancesJob);
 
 			perfCmd.End();
 			return writeInstancesJob;
-#endif
 		}
 	}
 
@@ -507,27 +550,42 @@ namespace CustomEntity {
 		[ReadOnly] public ComponentTypeHandle<MyEntityData> Data;
 		[ReadOnly] public ControllerECS Controller;
 
-		[NativeDisableUnsafePtrRestriction]
-		public RendererSystem.InstanceDataBuffer InstanceData;
+		public InstanceData.Batch.ThreadedUpload Upload;
+
+		//public bool BaseEntityIndicesChanged;
+		public uint LastSystemVersion;
 
 		[BurstCompile]
 		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
+
+			if (  //!chunk.DidOrderChange(LastSystemVersion) &&
+			      !chunk.DidChange(ref LocalTransforms, LastSystemVersion) &&
+			      !chunk.DidChange(ref Data, LastSystemVersion)) {
+				return;
+			}
 
 			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransforms);
 			NativeArray<MyEntityData> spinningData = chunk.GetNativeArray(ref Data);
 
 			int BaseInstanceIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
 
+			var obj2world = stackalloc float3x4[chunk.Count];
+			var color = stackalloc float4[chunk.Count];
+
 			for (int i = 0; i < chunk.Count; i++) {
-				int idx = BaseInstanceIdx + i;
+				//int idx = BaseInstanceIdx + i;
 				var transform = transforms[i];
 
 				var col = Controller.DebugSpatialGrid ?
 					MyEntityData.RandColor(UpdateSpatialGridSystem.CalcGridCell(Controller, transform.Position)) :
 					spinningData[i].Color;
-
-				InstanceData.from_transform(idx, transform, col);
+				
+				obj2world[i] = InstanceData.LocalTransform2float3x4(transform);
+				color[i] = float4(col.r, col.g, col.b, col.a); // Could avoid uploading color if it did not actually change
 			}
+			
+			Upload.WriteTransform(obj2world, BaseInstanceIdx, chunk.Count);
+			Upload.WriteColor(color, BaseInstanceIdx, chunk.Count);
 		}
 	}
 
