@@ -164,7 +164,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   Mode: 2
-  Ratio: 0.799
+  Ratio: 1
   Max: 100000
   Tiling:
     x: 100

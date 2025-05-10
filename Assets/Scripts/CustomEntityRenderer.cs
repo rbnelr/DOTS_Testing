@@ -326,21 +326,41 @@ namespace CustomEntity {
 		
 		static readonly ProfilerMarker perf = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.FindNewAndDeletedChunks");
 		
+		// UpdateGpuAllocation is almost impossible to bust compile due to
+		// GraphicsBuffer, SparseUploader and BatchRendererGroup.AddBatch being managed
+		// Trying to pull data structures sufficiently apart is a nightmare and I could not even get it to work
+		// so we have to accept first finding new/deleted chunks in burst, then iterating those in slow managed code afterwards
 		[BurstCompile]
 		static void FindNewAndDeletedChunks (in EntityQuery query, in NativeHashMap<ArchetypeChunk, BatchChunk> ChunkBatches,
 				ref NativeList<ArchetypeChunk> newChunks, ref NativeList<ArchetypeChunk> deletedChunks) {
 			perf.Begin();
 
+			// Filter to skip any chunks which did not have any entity creation/deletion inside them to speed up first loop
+			// (Can't directly filter for newly created chunks or deleted chunks)
+			query.AddOrderVersionFilter();
 			var queryChunks = query.ToArchetypeChunkArray(Allocator.Temp);
+			query.ResetFilter();
+			
+			int trackedChunkCount = ChunkBatches.Count;
+			int queryChunkCount = query.CalculateChunkCountWithoutFiltering();
+			int addedChunkCount = 0;
+
 			foreach (var chunk in queryChunks) {
 				if (!ChunkBatches.ContainsKey(chunk)) {
 					newChunks.Add(chunk);
+					addedChunkCount++;
 				}
 			}
 
-			foreach (var chunk in ChunkBatches) {
-				if (chunk.Key.Invalid()) {
-					deletedChunks.Add(chunk.Key);
+			// We can know the number of deleted chunks via gigabrain set theory black magic hackery
+			int deletedChunkCount = (queryChunkCount - trackedChunkCount) - addedChunkCount;
+
+			// Now we can early out, though I don't know a better way of finding the deleted chunks without checking all of them
+			if (deletedChunkCount > 0) {
+				foreach (var chunk in ChunkBatches) {
+					if (chunk.Key.Invalid()) {
+						deletedChunks.Add(chunk.Key);
+					}
 				}
 			}
 
@@ -350,8 +370,8 @@ namespace CustomEntity {
 		}
 
 		public void UpdateGpuAllocation (ref BatchRendererGroup brg, in EntityQuery query) {
-			NativeList<ArchetypeChunk> newChunks = new(32, Allocator.Temp);
-			NativeList<ArchetypeChunk> deletedChunks = new(32, Allocator.Temp);
+			NativeList<ArchetypeChunk> newChunks = new(Allocator.Temp);
+			NativeList<ArchetypeChunk> deletedChunks = new(Allocator.Temp);
 			FindNewAndDeletedChunks(query, ChunkBatches, ref newChunks, ref deletedChunks);
 
 			foreach (var chunk in newChunks) {
@@ -725,11 +745,11 @@ namespace CustomEntity {
 
 		[BurstCompile]
 		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
-			//if (  //chunk.DidOrderChange(LastSystemVersion) ||
-			//      chunk.DidChange(ref LocalTransforms, LastSystemVersion) ||
-			//      chunk.DidChange(ref Data, LastSystemVersion)) {
+			if (  chunk.DidOrderChange(LastSystemVersion) ||
+			      chunk.DidChange(ref LocalTransforms, LastSystemVersion) ||
+			      chunk.DidChange(ref Data, LastSystemVersion)) {
 				ReuploadChunkInstances(chunk, unfilteredChunkIndex);
-			//}
+			}
 		}
 	}
 
