@@ -174,6 +174,12 @@ namespace CustomEntity {
 			cur_offset += size;
 			return offset;
 		}
+		
+		
+		public const int InstancesPerChunk = 128;
+		//public const int ChunksPerBatch = 2;
+		public const int ChunksPerBatch = 128;
+		public const int InstancesPerBatch = ChunksPerBatch * InstancesPerChunk;
 
 		public unsafe struct BufferLayout {
 			public int total_size;
@@ -190,7 +196,7 @@ namespace CustomEntity {
 
 				total_size = alignup(total_size, 4); // GraphicsBuffer must be 4 byte aligned
 
-				Debug.Log($"GPU BufferLayout: NumInstances: {NumInstances} -> total_size: {total_size / 1024/1204} MB");
+				Debug.Log($"GPU BufferLayout: NumInstances: {NumInstances} -> total_size: {total_size} B");
 			}
 			
 			public NativeArray<MetadataValue> GetMetadata () {
@@ -202,158 +208,258 @@ namespace CustomEntity {
 			}
 		}
 
-
-		public struct Batch {
+		public class Batch {
 			public GraphicsBuffer buf;
 			public SparseUploader upload;
-			public BufferLayout layout;
 			public BatchID batchID;
+			public int CurChunks;
 
-			public int InstanceCount;
-			public int ChunkCount;
-
-			ThreadedSparseUploader tsu;
-
-			public struct ThreadedUpload {
-				ThreadedSparseUploader tsu;
-				BufferLayout layout;
-
-				public ThreadedUpload (ThreadedSparseUploader tsu, BufferLayout layout) {
-					this.tsu = tsu;
-					this.layout = layout;
-				}
-				
-				[MethodImpl(MethodImplOptions.AggressiveInlining)]
-				public unsafe void WriteTransform (float3x4* obj2world, int baseIndex, int count) {
-					tsu.AddMatrixUploadAndInverse(obj2world, count,
-						layout.offs_obj2world + baseIndex*sizeof(float3x4),
-						layout.offs_world2obj + baseIndex*sizeof(float3x4),
-						ThreadedSparseUploader.MatrixType.MatrixType3x4, ThreadedSparseUploader.MatrixType.MatrixType3x4);
-				}
-				[MethodImpl(MethodImplOptions.AggressiveInlining)]
-				public unsafe void WriteColor (float4* color, int baseIndex, int count) {
-					tsu.AddUpload(color, count*sizeof(float4), layout.offs_color + baseIndex*sizeof(float4));
-				}
-
-			}
-
-			public Batch (ref BatchRendererGroup brg, int instanceCount, int chunkCount) {
-				layout = new BufferLayout(instanceCount);
+			public Batch (ref BatchRendererGroup brg, in BufferLayout layout) {
 				buf = new GraphicsBuffer(GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.None, layout.total_size/4, 4);
 				upload = new SparseUploader(buf);
 
-				InstanceCount = instanceCount;
-				ChunkCount = chunkCount;
-
 				batchID = brg.AddBatch(layout.GetMetadata(), buf.bufferHandle);
+				CurChunks = 0;
+
+				Debug.Log($"new Batch {layout.total_size} B");
 			}
+
 			public void Dispose (ref BatchRendererGroup brg) {
-				if (InstanceCount > 0) {
-					brg.RemoveBatch(batchID);
-					upload.Dispose();
-					buf.Dispose();
-					InstanceCount = 0;
+				brg.RemoveBatch(batchID);
+				upload.Dispose();
+				buf.Dispose();
+			}
+
+			public bool TryAllocChunk (out int idx) {
+				if (CurChunks < ChunksPerBatch) {
+					idx = CurChunks++;
+					return true;
 				}
-			}
-
-			public unsafe ThreadedUpload BeginUpload () {
-				//Debug.Log("BeginUpload");
-
-				tsu = upload.Begin(
-					maxDataSizeInBytes: (sizeof(float3x4) + sizeof(float4)) * InstanceCount,
-					biggestDataUpload: sizeof(float3x4) * 128, // float3x4 * Max Instances per Chunk
-					maxOperationCount: 2 * ChunkCount);
-				return new ThreadedUpload(tsu, layout);
-			}
-			public void EndUpload () {
-				//Debug.Log("EndUpload");
-
-				upload.EndAndCommit(tsu);
-				upload.FrameCleanup();
-				tsu = default;
+				idx = -1;
+				return false;
 			}
 		}
 
-		
-		#if false
-		//HashSet<GpuMemoryBlock> blocks;
-		//Dictionary<int, List<Block>> freelist;
+		public BufferLayout layout;
 
-		// Temp solution: One block per chunk
-		Dictionary<ArchetypeChunk, GpuMemoryBlock> chunkBlocks;
+		public List<Batch> batches;
+		public NativeHashMap<ArchetypeChunk, int2> ChunkBatches;
 
-		public InstanceData () {
-			chunkBlocks = new Dictionary<ArchetypeChunk, GpuMemoryBlock>(32);
-		}
-		public void Dispose () {
-			foreach (var b in chunkBlocks.Values) {
-				b.Dispose();
-			}
-			chunkBlocks.Clear();
-		}
+		public int NumBatches => batches.Count;
 
-		public void UpdateGpuAllocation (in EntityQuery query) {
-			var chunks = query.ToArchetypeChunkArray(Allocator.Temp);
+		int2 AllocChunk (ref BatchRendererGroup brg, in ArchetypeChunk chunk) {
+			//Debug.Assert(!ChunkBatches.ContainsKey(chunk));
 
-			foreach (var chunk in chunks) {
-				if (!chunkBlocks.ContainsKey(chunk)) {
-					var block = new GpuMemoryBlock(new BlockLayout(chunk.Capacity));
-					chunkBlocks.Add(chunk, block);
-
-					Debug.Log($"New Chunk");
+			for (int batchIdx=0; batchIdx<batches.Count; batchIdx++) {
+				if (batches[batchIdx].TryAllocChunk(out int idx)) {
+					ChunkBatches.Add(chunk, int2(batchIdx, idx));
+					return int2(batchIdx, idx);
 				}
 			}
 			
-			var deletedChunks = new NativeList<ArchetypeChunk>(0, Allocator.Temp);
-			
-			Debug.Log($"New Count: {chunkBlocks.Count}");
+			int batchIdx2 = batches.Count;
+			var batch = new Batch(ref brg, layout);
+			batches.Add(batch);
 
-			// None of these are working for some reason
-			foreach (var chunk in chunkBlocks.Keys) {
-				if (chunk.Invalid()) {
-					Debug.Log("Chunk Null");
-					deletedChunks.Add(chunk);
-				}
-				if (chunk == ArchetypeChunk.Null) {
-					Debug.Log("Chunk Null");
-					deletedChunks.Add(chunk);
-				}
-				if (chunk.Count == 0) {
-					Debug.Log("chunk.Count == 0");
-					deletedChunks.Add(chunk);
-				}
+			if (batch.TryAllocChunk(out int idx2)) {
+				ChunkBatches.Add(chunk, int2(batchIdx2, idx2));
+				return int2(batchIdx2, idx2);
 			}
 
-			foreach (var chunk in deletedChunks) {
-				chunkBlocks[chunk].Dispose();
-				chunkBlocks.Remove(chunk);
-			}
-
-			deletedChunks.Dispose();
-			chunks.Dispose();
+			Debug.Assert(false);
+			return int2(-1, -1);
 		}
-		#else
-		public Batch batch;
 
+		public InstanceData (ref BatchRendererGroup brg) {
+			layout = new BufferLayout(InstancesPerBatch);
+			batches = new List<Batch>();
+
+			ChunkBatches = new NativeHashMap<ArchetypeChunk, int2>(16, Allocator.Persistent);
+		}
+		//void resize (ref BatchRendererGroup brg, int instanceCount) {
+		//	int curBatches = batches.Count;
+		//	int newBatches = (instanceCount + BatchSize-1) / BatchSize;
+		//
+		//	if (newBatches > curBatches) {
+		//		Debug.Log($"Resize InstanceData {curBatches*BatchSize} -> {newBatches*BatchSize}");
+		//
+		//		for (int i=curBatches; i<newBatches; i++) {
+		//			batches.Add(new Batch(ref brg, layout));
+		//		}
+		//	}
+		//}
 		public void Dispose (ref BatchRendererGroup brg) {
-			batch.Dispose(ref brg);
+			foreach (var b in batches) {
+				b.Dispose(ref brg);
+			}
+			batches = null;
+
+			ChunkBatches.Dispose();
 		}
 
 		public void UpdateGpuAllocation (ref BatchRendererGroup brg, in EntityQuery query) {
 			//Debug.Log("UpdateGpuAllocation");
+			
+			//var instanceCount = query.CalculateEntityCountWithoutFiltering();
+			//
+			//var chunkCount = query.CalculateEntityCountWithoutFiltering();
+			//resize(ref brg, instanceCount);
+			
+			var remainingChunks = new HashSet<ArchetypeChunk>();
+			foreach (var chunk in ChunkBatches) {
+				remainingChunks.Add(chunk.Key);
+			}
 
-			var instanceCount = query.CalculateEntityCountWithoutFiltering();
+			var chunks = query.ToArchetypeChunkArray(Allocator.Temp);
+			foreach (var chunk in chunks) {
+				if (!ChunkBatches.ContainsKey(chunk)) {
+					var loc = AllocChunk(ref brg, chunk);
+					//Debug.Log($"AllocChunk: {loc}");
+				}
 
-			if (instanceCount > batch.InstanceCount) {
-				Debug.Log($"Resize InstanceData {batch.InstanceCount} -> {instanceCount}");
+				remainingChunks.Remove(chunk);
+				Debug.Assert(!chunk.Invalid());
+			}
 
-				batch.Dispose(ref brg);
-				
-				var chunkCount = query.CalculateEntityCountWithoutFiltering();
-				batch = new Batch(ref brg, instanceCount, chunkCount);
+			foreach (var chunk in remainingChunks) {
+				Debug.Log($"Deleted Chunk? {chunk.Count} {chunk == ArchetypeChunk.Null} {chunk.Invalid()}");
+				Debug.Assert(chunk.Invalid());
+			}
+			
+			var removeChunks = new NativeList<ArchetypeChunk>(Allocator.Temp);
+			foreach (var chunk in ChunkBatches) {
+				if (chunk.Key.Invalid()) {
+					removeChunks.Add(chunk.Key);
+				}
+			}
+			foreach (var chunk in removeChunks) {
+				ChunkBatches.Remove(chunk);
+				Debug.Log($"Delete Chunk!");
+			}
+			if (!removeChunks.IsEmpty)
+				Debug.Log($"Num Chunks now: {ChunkBatches.Count}");
+
+			removeChunks.Dispose();
+		}
+		
+		public struct ThreadedUploads {
+			public BufferLayout layout;
+			public NativeArray<ThreadedSparseUploader> uploaders;
+
+			//[MethodImpl(MethodImplOptions.AggressiveInlining)]
+			//public unsafe void WriteTransform (float3x4* obj2world, int baseIndex, int count) {
+			//	tsu.AddMatrixUploadAndInverse(obj2world, count,
+			//		layout.offs_obj2world + baseIndex*sizeof(float3x4),
+			//		layout.offs_world2obj + baseIndex*sizeof(float3x4),
+			//		ThreadedSparseUploader.MatrixType.MatrixType3x4, ThreadedSparseUploader.MatrixType.MatrixType3x4);
+			//}
+			//[MethodImpl(MethodImplOptions.AggressiveInlining)]
+			//public unsafe void WriteColor (float4* color, int baseIndex, int count) {
+			//	tsu.AddUpload(color, count*sizeof(float4), layout.offs_color + baseIndex*sizeof(float4));
+			//}
+			
+			[MethodImpl(MethodImplOptions.AggressiveInlining)]
+			public unsafe void Write (int BatchIdx, int BatchInstanceBaseIdx, float3x4* obj2world, float4* color, int count) {
+				//int batch = baseInstanceIdx / BatchSize;
+				//int localInstanceIdx = baseInstanceIdx % BatchSize;
+
+				Debug.Assert(BatchIdx >= 0 && BatchIdx < uploaders.Length);
+
+				var up = uploaders[BatchIdx];
+				up.AddMatrixUploadAndInverse(obj2world, count,
+					layout.offs_obj2world + BatchInstanceBaseIdx*sizeof(float3x4),
+					layout.offs_world2obj + BatchInstanceBaseIdx*sizeof(float3x4),
+					ThreadedSparseUploader.MatrixType.MatrixType3x4, ThreadedSparseUploader.MatrixType.MatrixType3x4);
+				up.AddUpload(color, count*sizeof(float4),
+					layout.offs_color + BatchInstanceBaseIdx*sizeof(float4));
+			}
+			[MethodImpl(MethodImplOptions.AggressiveInlining)]
+			public unsafe void Write (in ChunkVisiblity vis, float3x4* obj2world, float4* color, int count) {
+				Write(vis.BatchIdx, vis.BatchInstanceBaseIdx, obj2world, color, count);
 			}
 		}
-		#endif
+		
+		public unsafe ThreadedUploads BeginUpload () {
+			//Debug.Log("BeginUpload");
+			ThreadedUploads u;
+			u.layout = layout;
+			u.uploaders = new NativeArray<ThreadedSparseUploader>(batches.Count, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+			
+			for (int i=0; i<batches.Count; i++) {
+				var batch = batches[i];
+				u.uploaders[i] = batch.upload.Begin(
+					maxDataSizeInBytes: (sizeof(float3x4) + sizeof(float4)) * InstancesPerBatch,
+					biggestDataUpload: sizeof(float3x4) * InstancesPerChunk, // float3x4 * Max Instances per Chunk
+					maxOperationCount: 2 * ChunksPerBatch);
+				batches[i] = batch;
+			}
+
+			return u;
+		}
+		public void EndUpload (ref ThreadedUploads uploads) {
+			//Debug.Log("EndUpload");
+
+			for (int i=0; i<batches.Count; i++) {
+				var batch = batches[i];
+				batch.upload.EndAndCommit(uploads.uploaders[i]);
+				batch.upload.FrameCleanup();
+				batches[i] = batch;
+			}
+
+			uploads.uploaders.Dispose();
+		}
+	}
+	
+	public unsafe struct ChunkVisiblity {
+		public ArchetypeChunk chunk;
+		public int BatchIdx;
+		public int BatchInstanceBaseIdx;
+
+		public fixed byte EntityVisible[128]; // either bool for camera culling or split mask for light culling
+		public fixed int InstanceOffset[128]; // offsets within their split
+	}
+
+	public struct DrawData {
+		public unsafe struct Command {
+			// could use BatchDrawCommand.visibleCount
+			public int visibleInstances;
+			public BatchDrawCommand* cmd;
+		}
+		
+		public const int SplitPermut = 16;
+
+		public NativeArray<Command> cmds;
+		[ReadOnly] public NativeArray<BatchID> batchIDs;
+
+		public DrawData (in InstanceData instanceData) {
+			int batches = instanceData.NumBatches;
+			int maxCmds = SplitPermut * batches;
+			cmds = new NativeArray<Command>(maxCmds, Allocator.TempJob, NativeArrayOptions.ClearMemory);
+			batchIDs = new NativeArray<BatchID>(batches, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+			
+			for (int i=0; i<batches; i++) {
+				batchIDs[i] = instanceData.batches[i].batchID;
+			}
+		}
+		public void Dispose (JobHandle job) {
+			cmds.Dispose(job);
+			batchIDs.Dispose(job);
+		}
+
+		public unsafe Command GetCommand (in ChunkVisiblity vis, int cmdId) {
+			return cmds[vis.BatchIdx * SplitPermut + cmdId];
+		}
+
+		public unsafe int AddInstance (in ChunkVisiblity vis, int cmdId) {
+			ref var cmd = ref ((Command*)cmds.GetUnsafePtr())[vis.BatchIdx * SplitPermut + cmdId];
+			int newCount = Interlocked.Increment(ref cmd.visibleInstances);
+			return newCount - 1; // return offset that was assigned
+		}
+		public unsafe int AddInstances (in ChunkVisiblity vis, int cmdId, int count) {
+			ref var cmd = ref ((Command*)cmds.GetUnsafePtr())[vis.BatchIdx * SplitPermut + cmdId];
+			int newCount = Interlocked.Add(ref cmd.visibleInstances, count);
+			return newCount - count; // return offset range that was assigned
+		}
 	}
 
 	[UpdateInGroup(typeof(PresentationSystemGroup))]
@@ -410,7 +516,7 @@ namespace CustomEntity {
 			meshID = brg.RegisterMesh(input.mesh);
 			materialID = brg.RegisterMaterial(input.material);
 
-			instanceData = new InstanceData();
+			instanceData = new InstanceData(ref brg);
 		}
 		protected override void OnStopRunning () {
 			Debug.Log("CustomEntityRendererSystem.OnStopRunning");
@@ -420,16 +526,18 @@ namespace CustomEntity {
 			brg.Dispose();
 		}
 
-		NativeArray<int> entityIndices;
-
-		static readonly ProfilerMarker perfUpload = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.ReuploadInstanceGraphicsBuffer");
-		static readonly ProfilerMarker perfCmd = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.OnPerformCulling");
+		//NativeArray<int> entityIndices;
+		
+		static readonly ProfilerMarker perfUpload = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.UpdateGpuAllocation");
+		static readonly ProfilerMarker perfJobs = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.OnPerformCulling");
 
 		//[BurstCompile]
 		protected override void OnUpdate () {
 			//Debug.Log($"CustomEntityRendererSystem.OnUpdate");
 
+			perfUpload.Begin();
 			instanceData.UpdateGpuAllocation(ref brg, query);
+			perfUpload.End();
 			
 			ComputeInstanceDataJobHandle = new JobHandle();
 			NeedEndComputeInstanceData = false;
@@ -443,25 +551,27 @@ namespace CustomEntity {
 		void UploadInstanceData () {
 			var controller = SystemAPI.GetSingleton<ControllerECS>();
 
-			entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out var entityIndexJob);
+			//entityIndices = query.CalculateBaseEntityIndexArrayAsync(World.UpdateAllocator.Handle, Dependency, out var entityIndexJob);
 
 			c_transformsRO.Update(this);
 			c_dataRO.Update(this);
 			c_Asset.Update(this);
 
-			var upload = instanceData.batch.BeginUpload();
+			var uploads = instanceData.BeginUpload();
 
 			ComputeInstanceDataJobHandle = new ComputeInstanceDataJob {
-				ChunkBaseEntityIndices = entityIndices,
+				//ChunkBaseEntityIndices = entityIndices,
 				LocalTransforms = c_transformsRO,
 				Data = c_dataRO,
 				Controller = controller,
-				Upload = upload,
+				Uploads = uploads,
+				ChunkBatches = instanceData.ChunkBatches,
 				LastSystemVersion = LastSystemVersion,
-			}.ScheduleParallel(query, entityIndexJob);
+			//}.ScheduleParallel(query, entityIndexJob);
+			}.ScheduleParallel(query, Dependency);
 			
 			ComputeInstanceDataJobHandle.Complete();
-			instanceData.batch.EndUpload();
+			instanceData.EndUpload(ref uploads);
 			NeedEndComputeInstanceData = false;
 
 			// For some reason this is needed, is this right? We want to explictly only finish this job later in OnPerformCulling
@@ -496,7 +606,7 @@ namespace CustomEntity {
 
 			//Debug.Log($"CustomEntityRenderer.OnPerformCulling() NumInstances: {NumInstances}");
 
-			perfCmd.Begin();
+			perfJobs.Begin();
 
 			////
 			// Reuse Unity Culling Utils
@@ -504,15 +614,16 @@ namespace CustomEntity {
 
 			int NumChunks = query.CalculateChunkCount();
 			var chunkVisibilty = new NativeList<ChunkVisiblity>(NumChunks, Allocator.TempJob);
-			var drawCommands = new NativeArray<DrawCommand>(16, Allocator.TempJob, NativeArrayOptions.ClearMemory);
+
+			var drawData = new DrawData(instanceData);
 
 			var cullJob = new CullEntityInstancesJob {
-				ChunkBaseEntityIndices = entityIndices,
 				LocalTransformHandle = c_transformsRO,
 				AssetHandle = c_Asset,
 				ChunkBounds = c_ChunkBounds,
 				chunkVisibilty = chunkVisibilty.AsParallelWriter(),
-				drawCommands = drawCommands,
+				drawData = drawData,
+				ChunkBatches = instanceData.ChunkBatches,
 				CullingData = cullingData,
 				CullingViewType = cullingContext.viewType,
 			}.ScheduleParallel(query, ComputeInstanceDataJobHandle);
@@ -520,21 +631,22 @@ namespace CustomEntity {
 			var allocCmdsJob = new AllocDrawCommandsJob {
 				meshID = meshID,
 				materialID = materialID,
-				batchID = instanceData.batch.batchID, // Instead set up BatchCullingOutputDrawCommands inside here and only modify?
 				cullingOutputCommands = cullingOutput.drawCommands,
-				drawCommands = drawCommands,
+				drawData = drawData,
 			}.Schedule(cullJob);
 
 			var writeInstancesJob = new WriteDrawInstanceIndicesJob {
 				chunkVisibilty = chunkVisibilty.AsDeferredJobArray(),
-				drawCommands = drawCommands,
+				drawData = drawData,
 				cullingOutputCommands = cullingOutput.drawCommands,
 			}.Schedule(chunkVisibilty, 8, allocCmdsJob);
 
-			chunkVisibilty.Dispose(writeInstancesJob);
-			drawCommands.Dispose(writeInstancesJob);
+			writeInstancesJob.Complete();
 
-			perfCmd.End();
+			chunkVisibilty.Dispose(writeInstancesJob);
+			drawData.Dispose(writeInstancesJob);
+
+			perfJobs.End();
 			return writeInstancesJob;
 		}
 	}
@@ -545,29 +657,23 @@ namespace CustomEntity {
 	// Might also be able to lazily upload during cull
 	[BurstCompile]
 	unsafe partial struct ComputeInstanceDataJob : IJobChunk {
-		[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
+		//[ReadOnly] public NativeArray<int> ChunkBaseEntityIndices;
 		[ReadOnly] public ComponentTypeHandle<LocalTransform> LocalTransforms;
 		[ReadOnly] public ComponentTypeHandle<MyEntityData> Data;
 		[ReadOnly] public ControllerECS Controller;
 
-		public InstanceData.Batch.ThreadedUpload Upload;
+		[ReadOnly] public InstanceData.ThreadedUploads Uploads;
+		[ReadOnly] public NativeHashMap<ArchetypeChunk, int2> ChunkBatches;
 
 		//public bool BaseEntityIndicesChanged;
 		public uint LastSystemVersion;
 
-		[BurstCompile]
-		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
-
-			if (  //!chunk.DidOrderChange(LastSystemVersion) &&
-			      !chunk.DidChange(ref LocalTransforms, LastSystemVersion) &&
-			      !chunk.DidChange(ref Data, LastSystemVersion)) {
-				return;
-			}
-
+		void ReuploadChunkInstances (in ArchetypeChunk chunk, int unfilteredChunkIndex) {
+			
 			NativeArray<LocalTransform> transforms = chunk.GetNativeArray(ref LocalTransforms);
 			NativeArray<MyEntityData> spinningData = chunk.GetNativeArray(ref Data);
 
-			int BaseInstanceIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
+			//int BaseInstanceIdx = ChunkBaseEntityIndices[unfilteredChunkIndex];
 
 			var obj2world = stackalloc float3x4[chunk.Count];
 			var color = stackalloc float4[chunk.Count];
@@ -584,8 +690,19 @@ namespace CustomEntity {
 				color[i] = float4(col.r, col.g, col.b, col.a); // Could avoid uploading color if it did not actually change
 			}
 			
-			Upload.WriteTransform(obj2world, BaseInstanceIdx, chunk.Count);
-			Upload.WriteColor(color, BaseInstanceIdx, chunk.Count);
+			int2 b = ChunkBatches[chunk];
+			int BatchIdx = b.x;
+			int BatchInstanceBaseIdx = b.y * InstanceData.InstancesPerChunk;
+			Uploads.Write(BatchIdx, BatchInstanceBaseIdx, obj2world, color, chunk.Count);
+		}
+
+		[BurstCompile]
+		public void Execute (in ArchetypeChunk chunk, int unfilteredChunkIndex, bool useEnabledMask, in v128 chunkEnabledMask) {
+			//if (  //chunk.DidOrderChange(LastSystemVersion) ||
+			//      chunk.DidChange(ref LocalTransforms, LastSystemVersion) ||
+			//      chunk.DidChange(ref Data, LastSystemVersion)) {
+				ReuploadChunkInstances(chunk, unfilteredChunkIndex);
+			//}
 		}
 	}
 
