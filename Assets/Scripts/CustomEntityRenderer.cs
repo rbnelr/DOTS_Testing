@@ -153,6 +153,7 @@ namespace CustomEntity {
 		}
 	}
 
+	[BurstCompile]
 	public struct InstanceData {
 		
 		[MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -211,13 +212,13 @@ namespace CustomEntity {
 		// but for BatchRendererGroup it seems more like a packed set of instance data,
 		// which can still have separate meshes/materials and thus require more actual draws
 		public class Batch {
-			public GraphicsBuffer buf;
+			GraphicsBuffer buf;
 			public SparseUploader upload;
 			public BatchID batchID;
 			
-			// TODO: improve this! Needs freelist
-			public int CurChunks;
-			public int DeadChunks;
+			public int UsedChunks;
+			public NativeList<int> freelist;
+			public bool Full => UsedChunks >= ChunksPerBatch;
 
 			public Batch (ref BatchRendererGroup brg, in BufferLayout layout) {
 				buf = new GraphicsBuffer(GraphicsBuffer.Target.Raw, GraphicsBuffer.UsageFlags.None, layout.total_size/4, 4);
@@ -225,85 +226,54 @@ namespace CustomEntity {
 
 				batchID = brg.AddBatch(layout.GetMetadata(), buf.bufferHandle);
 
-				CurChunks = 0;
-				DeadChunks = 0;
+				UsedChunks = 0;
+				freelist = new(ChunksPerBatch, Allocator.Persistent);
 
 				Debug.Log($"new Batch {layout.total_size} B");
 			}
-
 			public void Dispose (ref BatchRendererGroup brg) {
 				brg.RemoveBatch(batchID);
 				upload.Dispose();
 				buf.Dispose();
+				freelist.Dispose();
 			}
 
-			public bool TryAllocChunk (out BatchChunk entry) {
-				entry.batchID = batchID;
+			// Allocate chunk slot in arbirary slot in fixed size batch memory
+			public BatchChunk AllocChunk () {
+				Debug.Assert(!Full);
 
-				if (CurChunks < ChunksPerBatch) {
-					entry.InstanceOffset = CurChunks++ * InstancesPerChunk;
-					return true;
+				var res = new BatchChunk { batchID = batchID };
+				// Allocate at back if no free slots
+				if (freelist.IsEmpty) {
+					res.Slot = UsedChunks++;
+					return res;
 				}
-				entry.InstanceOffset = -1;
-				return false;
+
+				// Allocate random empty slot
+				res.Slot = freelist[0];
+				freelist.RemoveAtSwapBack(0);
+
+				UsedChunks++;
+				return res;
 			}
-			public void FreeChunk () {
-				DeadChunks++;
+			// Free up chunk slot
+			public void FreeChunk (int slot) {
+				Debug.Assert(UsedChunks > 0);
+				UsedChunks--;
+				freelist.AddNoResize(slot);
 			}
 		}
 		public struct BatchChunk {
 			public BatchID batchID;
-			public int InstanceOffset;
+			public int Slot;
+			public int InstanceOffset => Slot * InstancesPerChunk;
 		}
 
 		public BufferLayout layout;
 
 		public Dictionary<BatchID, Batch> batches;
 		public NativeHashMap<ArchetypeChunk, BatchChunk> ChunkBatches; // TODO: Any hashmap values like this could be turned into a chunk component!
-
-		BatchChunk AllocChunkData (ref BatchRendererGroup brg, in ArchetypeChunk chunk) {
-			//Debug.Assert(!ChunkBatches.ContainsKey(chunk));
-
-			// TODO: improve this!
-
-			// Scan Batches for free chunk
-			BatchChunk entry;
-
-			foreach (var b in batches.Values) {
-				if (b.TryAllocChunk(out entry)) {
-					ChunkBatches.Add(chunk, entry);
-					return entry;
-				}
-			}
-			
-			// All batches full, alloc new batch
-			int batchIdx2 = batches.Count;
-			var batch = new Batch(ref brg, layout);
-			batches.Add(batch.batchID, batch);
-
-			if (batch.TryAllocChunk(out entry)) {
-				ChunkBatches.Add(chunk, entry);
-				return entry;
-			}
-
-			Debug.Assert(false);
-			return default;
-		}
-		void FreeChunkData (ref BatchRendererGroup brg, in ArchetypeChunk chunk) {
-			var entry = ChunkBatches[chunk];
-			var batch = batches[entry.batchID];
-
-			batch.FreeChunk();
-			if (batch.DeadChunks == batch.CurChunks) {
-				Debug.Log($"delete Batch CurChunks: {batch.CurChunks} DeadChunks: {batch.DeadChunks}");
-
-				batches.Remove(batch.batchID);
-				batch.Dispose(ref brg);
-			}
-
-			ChunkBatches.Remove(chunk);
-		}
-
+		
 		public InstanceData (ref BatchRendererGroup brg) {
 			layout = new BufferLayout(InstancesPerBatch);
 			batches = new();
@@ -319,53 +289,92 @@ namespace CustomEntity {
 			ChunkBatches.Dispose();
 		}
 
-		public void UpdateGpuAllocation (ref BatchRendererGroup brg, in EntityQuery query) {
-			//Debug.Log("UpdateGpuAllocation");
-			
-			//var remainingChunks = new HashSet<ArchetypeChunk>();
-			//foreach (var chunk in ChunkBatches) {
-			//	remainingChunks.Add(chunk.Key);
-			//}
-
-			var chunks = query.ToArchetypeChunkArray(Allocator.Temp);
-			foreach (var chunk in chunks) {
-				if (!ChunkBatches.ContainsKey(chunk)) {
-					var loc = AllocChunkData(ref brg, chunk);
-					//Debug.Log($"AllocChunk: {loc}");
+		BatchChunk AllocChunkData (ref BatchRendererGroup brg, in ArchetypeChunk chunk) {
+			// Scan Batches for free chunk, could use freelist but filling empty slots from the front _feels_ more optimal (is it?)
+			BatchChunk entry;
+			foreach (var b in batches.Values) {
+				if (!b.Full) {
+					entry = b.AllocChunk();
+					ChunkBatches.Add(chunk, entry);
+					return entry;
 				}
+			}
+			
+			// All batches full, alloc new batch
+			var batch = new Batch(ref brg, layout);
+			batches.Add(batch.batchID, batch);
 
-				//remainingChunks.Remove(chunk);
-				//Debug.Assert(!chunk.Invalid());
+			entry = batch.AllocChunk();
+			ChunkBatches.Add(chunk, entry);
+			return entry;
+		}
+		void FreeChunkData (ref BatchRendererGroup brg, in ArchetypeChunk chunk) {
+			var entry = ChunkBatches[chunk];
+			var batch = batches[entry.batchID];
+
+			batch.FreeChunk(entry.Slot);
+
+			if (batch.UsedChunks == 0) {
+				Debug.Log($"delete Batch");
+
+				batches.Remove(batch.batchID);
+				batch.Dispose(ref brg);
 			}
 
-			//foreach (var chunk in remainingChunks) {
-			//	//Debug.Log($"Deleted Chunk? {chunk.Count} {chunk == ArchetypeChunk.Null} {chunk.Invalid()}");
-			//	Debug.Assert(chunk.Invalid());
-			//}
-			
-			var removeChunks = new NativeList<ArchetypeChunk>(Allocator.Temp);
+			ChunkBatches.Remove(chunk);
+		}
+		
+		static readonly ProfilerMarker perf = new ProfilerMarker(ProfilerCategory.Render, "CustomEntityRenderer.FindNewAndDeletedChunks");
+		
+		[BurstCompile]
+		static void FindNewAndDeletedChunks (in EntityQuery query, in NativeHashMap<ArchetypeChunk, BatchChunk> ChunkBatches,
+				ref NativeList<ArchetypeChunk> newChunks, ref NativeList<ArchetypeChunk> deletedChunks) {
+			perf.Begin();
+
+			var queryChunks = query.ToArchetypeChunkArray(Allocator.Temp);
+			foreach (var chunk in queryChunks) {
+				if (!ChunkBatches.ContainsKey(chunk)) {
+					newChunks.Add(chunk);
+				}
+			}
+
 			foreach (var chunk in ChunkBatches) {
 				if (chunk.Key.Invalid()) {
-					removeChunks.Add(chunk.Key);
+					deletedChunks.Add(chunk.Key);
 				}
 			}
-			foreach (var chunk in removeChunks) { // Can't Remove from hashmap while iterating!
-				FreeChunkData(ref brg, chunk);
-				//Debug.Log($"Delete Chunk!");
-			}
-			//if (!removeChunks.IsEmpty)
-			//	Debug.Log($"Num Chunks now: {ChunkBatches.Count}");
 
-			removeChunks.Dispose();
-			
-			int totalUsed = 0;
-			int totalAllocated = 0;
-			foreach (var batch in batches) {
-				totalUsed += batch.Value.CurChunks;
-				totalAllocated += ChunksPerBatch;
+			queryChunks.Dispose();
+
+			perf.End();
+		}
+
+		public void UpdateGpuAllocation (ref BatchRendererGroup brg, in EntityQuery query) {
+			NativeList<ArchetypeChunk> newChunks = new(32, Allocator.Temp);
+			NativeList<ArchetypeChunk> deletedChunks = new(32, Allocator.Temp);
+			FindNewAndDeletedChunks(query, ChunkBatches, ref newChunks, ref deletedChunks);
+
+			foreach (var chunk in newChunks) {
+				AllocChunkData(ref brg, chunk);
 			}
-			float wasted = (totalAllocated - totalUsed) / (float)totalAllocated;
-			Debug.Log($"Chunks allocated {totalUsed}, Wasted {wasted*100} % in {batches.Count} Batches!");
+			foreach (var chunk in deletedChunks) { // Can't Remove from hashmap while iterating!
+				FreeChunkData(ref brg, chunk);
+			}
+			
+		#if false
+			{
+				int totalUsed = 0;
+				int totalAllocated = 0;
+				string usage = "";
+				foreach (var batch in batches) {
+					totalUsed += batch.Value.UsedChunks;
+					totalAllocated += ChunksPerBatch;
+					usage += $"{batch.Value.UsedChunks}, ";
+				}
+				float wasted = (totalAllocated - totalUsed) / (float)totalAllocated;
+				Debug.Log($"Chunks allocated {totalUsed}, Wasted {wasted*100} % in {batches.Count} Batches ({usage})!");
+			}
+		#endif
 		}
 		
 		public struct ThreadedUploads {
