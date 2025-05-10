@@ -279,7 +279,7 @@ namespace CustomEntity {
 
 		public NativeList<ChunkVisiblity>.ParallelWriter chunkVisibilty;
 		public DrawData drawData;
-		[ReadOnly] public NativeHashMap<ArchetypeChunk, int2> ChunkBatches;
+		[ReadOnly] public NativeHashMap<ArchetypeChunk, InstanceData.BatchChunk> ChunkBatches;
 
 		unsafe struct SplitCounts {
 			public fixed int visibleCount[16];
@@ -308,12 +308,9 @@ namespace CustomEntity {
 			var asset = chunk.GetSharedComponent(AssetHandle);
 			if (!asset.Mesh.IsValid()) return;
 		
-			int2 b = ChunkBatches[chunk];
-
 			ChunkVisiblity vis;
 			vis.chunk = chunk;
-			vis.BatchIdx = b.x;
-			vis.BatchInstanceBaseIdx = b.y * InstanceData.InstancesPerChunk;
+			vis.Batch = ChunkBatches[chunk];
 
 			if (CullingViewType == BatchCullingViewType.Light) {
 				ref var splits = ref CullingData.Splits;
@@ -348,7 +345,13 @@ namespace CustomEntity {
 				
 				if (chunkSplitVisible > 0) {
 					// Draw-local chunk instances start offset
-					int offset = drawData.AddInstances(vis, chunkSplitVisible, chunk.Count);
+					var settings = new DrawSettings {
+						BatchID = vis.Batch.batchID,
+						SplitMask = chunkSplitVisible
+					};
+					settings.ComputeHashCode(); // ??
+
+					int offset = drawData.AddInstances(settings, chunk.Count);
 					
 					for (int i=0; i<chunk.Count; i++) {
 						vis.EntityVisible[i] = chunkSplitVisible;
@@ -368,11 +371,17 @@ namespace CustomEntity {
 					!= FrustumPlanes.IntersectResult.Out;
 
 				if (isVisible) {
-					int offset = drawData.AddInstances(vis, 1, chunk.Count);
+					var settings = new DrawSettings {
+						BatchID = vis.Batch.batchID,
+						SplitMask = 1
+					};
+					settings.ComputeHashCode(); // ??
+
+					int baseInstanceIdx = drawData.AddInstances(settings, chunk.Count);
 					
 					for (int i=0; i<chunk.Count; i++) {
 						vis.EntityVisible[i] = 1;
-						vis.InstanceOffset[i] = offset + i;
+						vis.InstanceOffset[i] = baseInstanceIdx + i;
 					}
 
 					chunkVisibilty.AddNoResize(vis);
@@ -393,30 +402,59 @@ namespace CustomEntity {
 
 		[BurstCompile]
 		public void Execute () {
-			int drawCommandsCount = 0;
+			NativeList<BatchDrawCommand> commandList = new(64, Allocator.TempJob);
 			int visibleInstanceCount = 0;
 			
-			// Calc total visible instances
-			foreach (var cmd in drawData.cmds) {
+			// Calc total visible instances and allocate subrange of final instance index buffer for each command
+			// Also called a prefix sum which is hard to parallelize
+			for (var i=0; i<drawData.commands.Length; i++) {
+				var cmd = drawData.commands[i];
 				if (cmd.visibleInstances > 0) {
-					drawCommandsCount++;
+					var batchCmd = new BatchDrawCommand {
+						// Start in instance index buffer
+						visibleOffset = (uint)visibleInstanceCount,
+						visibleCount = (uint)cmd.visibleInstances,
+
+						batchID = cmd.DrawSettings.BatchID,
+						materialID = materialID,
+						meshID = meshID,
+
+						submeshIndex = 0,
+						splitVisibilityMask = cmd.DrawSettings.SplitMask,
+						flags = 0,
+						sortingPosition = 0,
+					};
+
 					visibleInstanceCount += cmd.visibleInstances;
+					commandList.Add(batchCmd);
 				}
 			}
 
 			// Allocate commands and single instance index buffer
 			// These are auto-freed by the batch renderer
-			var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>()*drawCommandsCount, UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
+			var cmds   = (BatchDrawCommand*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawCommand>()*commandList.Length, UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 			var ranges = (BatchDrawRange  *)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<BatchDrawRange>(), UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 			var visibleInstances = (int*)UnsafeUtility.Malloc(UnsafeUtility.SizeOf<int>() * visibleInstanceCount, UnsafeUtility.AlignOf<long>(), Allocator.TempJob);
 			
+			// Not sure if NativeLists internal buffer is safe to be passed to BatchCullingOutputDrawCommands, do a malloc+copy!
+			UnsafeUtility.MemCpy(cmds, commandList.GetUnsafePtr(), commandList.Length * sizeof(BatchDrawCommand));
+			
+			BatchDrawCommand* cmdOut = cmds;
+			for (var i=0; i<drawData.commands.Length; i++) {
+				var cmd = drawData.commands[i];
+				if (cmd.visibleInstances > 0) {
+					cmd.cmd = cmdOut++; // TODO: get real ptr for WriteDrawInstanceIndicesJob, though only visibleOffset is actually needed!
+					drawData.commands[i] = cmd;
+				}
+			}
+
 			cullingOutputCommands[0] = new BatchCullingOutputDrawCommands {
 				drawCommands     = cmds,
 				drawRanges       = ranges,
 				visibleInstances = visibleInstances,
 				drawCommandPickingInstanceIDs = null,
 
-				drawCommandCount = drawCommandsCount,
+				drawCommandCount = commandList.Length,
 				drawRangeCount = 1,
 				visibleInstanceCount = visibleInstanceCount,
 
@@ -424,49 +462,18 @@ namespace CustomEntity {
 				instanceSortingPositionFloatCount = 0,
 			};
 
-			int batches = drawData.cmds.Length / DrawData.SplitPermut;
-
-			// Allocate subrange of instance index buffer for each command
-			int visibleOffset = 0;
-			BatchDrawCommand* curBatchCmd = cmds;
-			for (int batch=0; batch<batches; batch++) {
-				for (int splitMask=0; splitMask<DrawData.SplitPermut; ++splitMask) {
-					var cmd = drawData.cmds[batch*DrawData.SplitPermut + splitMask];
-
-					if (cmd.visibleInstances > 0) {
-						cmd.cmd = curBatchCmd++; // Get next command from allocated BatchDrawCommands
-
-						*cmd.cmd = new BatchDrawCommand {
-							// Start in instance index buffer
-							visibleOffset = (uint)visibleOffset,
-							visibleCount = (uint)cmd.visibleInstances,
-
-							batchID = drawData.batchIDs[batch],
-							materialID = materialID,
-							meshID = meshID,
-							submeshIndex = 0,
-							splitVisibilityMask = (ushort)splitMask,
-							flags = 0,
-							sortingPosition = 0,
-						};
-
-						visibleOffset += cmd.visibleInstances;
-
-						drawData.cmds[batch*DrawData.SplitPermut + splitMask] = cmd;
-					}
-				}
-			}
-
 			ranges[0] = new BatchDrawRange {
 				drawCommandsType = BatchDrawCommandType.Direct,
 				drawCommandsBegin = 0,
-				drawCommandsCount = (uint)drawCommandsCount,
+				drawCommandsCount = (uint)commandList.Length,
 				filterSettings = new BatchFilterSettings {
 					renderingLayerMask = 0xffffffff,
 					receiveShadows = true,
 					shadowCastingMode = ShadowCastingMode.On // Should I not get this from the material? How?
 				},
 			};
+
+			commandList.Dispose();
 		}
 	}
 
@@ -485,12 +492,18 @@ namespace CustomEntity {
 
 			for (int i=0; i<vis.chunk.Count; i++) {
 				// Instance indices are relative to the batch graphics buffer
-				int InstanceIdx = vis.BatchInstanceBaseIdx + i;
+				int InstanceIdx = vis.Batch.InstanceOffset + i;
 			
 				byte splitMask = vis.EntityVisible[i];
 				if (splitMask > 0) {
+					var settings = new DrawSettings {
+						BatchID = vis.Batch.batchID,
+						SplitMask = splitMask
+					};
+					settings.ComputeHashCode();
+
 					// Finally write instance index
-					var cmd = drawData.GetCommand(vis, splitMask);
+					var cmd = drawData.commands[drawData.cmdLookup[settings]];
 					int outputIdx = vis.InstanceOffset[i] + (int)cmd.cmd->visibleOffset;
 					outputInstances[outputIdx] = InstanceIdx;
 				}
