@@ -343,6 +343,8 @@ namespace CustomEntity {
 					}
 				}
 				
+				// Use the same SplitMask for the entire chunk, since likely only some chunks will cross split boundaries
+				// Entities Graphics similarily only does culling for individual entities in some cases, and if the chunk is garantueed to be partially in/out
 				if (chunkSplitVisible > 0) {
 					// Draw-local chunk instances start offset
 					var settings = new DrawSettings {
@@ -489,6 +491,12 @@ namespace CustomEntity {
 		public void Execute (int index) {
 			var vis = chunkVisibilty[index];
 			int* outputInstances = cullingOutputCommands[0].visibleInstances;
+			
+			var drawSettings = new DrawSettings {
+				BatchID = vis.Batch.batchID,
+				SplitMask = 0
+			};
+			int drawVisibleOffset = 0;
 
 			for (int i=0; i<vis.chunk.Count; i++) {
 				// Instance indices are relative to the batch graphics buffer
@@ -496,15 +504,18 @@ namespace CustomEntity {
 			
 				byte splitMask = vis.EntityVisible[i];
 				if (splitMask > 0) {
-					var settings = new DrawSettings {
-						BatchID = vis.Batch.batchID,
-						SplitMask = splitMask
-					};
-					settings.ComputeHashCode();
+					// Optimize sequential equal DrawSettings, by avoiding expensive hashmap lookup
+					// Currently entire chunk has equal DrawSettings(!), but later mesh (via LOD at least) will be part of DrawSettings
+					if (splitMask != drawSettings.SplitMask) {
+						drawSettings = new DrawSettings { BatchID = drawSettings.BatchID, SplitMask = splitMask };
+						drawSettings.ComputeHashCode();
+
+						var cmd = drawData.commands[drawData.cmdLookup[drawSettings]];
+						drawVisibleOffset = (int)cmd.cmd->visibleOffset;
+					}
 
 					// Finally write instance index
-					var cmd = drawData.commands[drawData.cmdLookup[settings]];
-					int outputIdx = vis.InstanceOffset[i] + (int)cmd.cmd->visibleOffset;
+					int outputIdx = vis.InstanceOffset[i] + drawVisibleOffset;
 					outputInstances[outputIdx] = InstanceIdx;
 				}
 			}

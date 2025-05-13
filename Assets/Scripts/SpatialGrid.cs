@@ -252,10 +252,9 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 
 				if (any(spatialKey != curSpatialGrid.Key)) {
 					//Ecb.SetSharedComponent(unfilteredChunkIndex, entities[i], new CustomEntitySpatialGrid { Key = spatialKey });
+					//Interlocked.Add(ref ((int*)DebugCount.GetUnsafePtr())[0], 1);
 
 					MovedEntities.Add(spatialKey, entities[i]);
-
-					//Interlocked.Add(ref ((int*)DebugCount.GetUnsafePtr())[0], 1);
 				}
 			}
 		}
@@ -276,12 +275,12 @@ public partial struct UpdateSpatialGridSystem : ISystem {
 			if (asset.Mesh.IsValid()) {
 
 				for (int i=0; i<chunk.Count; i++) {
-					var aabb = (MinMaxAABB)asset.CalcWorldBounds(transforms[i]);
+					var aabb = asset.CalcWorldBounds(transforms[i]);
 					bounds.Encapsulate(aabb);
 				}
 			}
 
-			chunk.SetChunkComponentData(ref ChunkBounds, new ChunkBounds{ bounds = bounds });
+			chunk.SetChunkComponentData(ref ChunkBounds, new ChunkBounds{ bounds = (AABB)bounds });
 		}
 	}
 }

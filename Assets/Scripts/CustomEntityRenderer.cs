@@ -74,10 +74,21 @@ namespace CustomEntity {
 
 		// Memoize the expensive 128-bit hash
 		uint4 Hash128;
-
-		public AABB CalcWorldBounds (in LocalTransform transform) {
+		
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public MinMaxAABB CalcWorldBounds (in LocalTransform transform) {
 			//return new AABB { Center = transform.Position, Extents = 1 }; // TODO: actually transform bounds
-			return AABB.Transform(transform.ToMatrix(), RenderBoundsObj);
+			//return (MinMaxAABB)AABB.Transform(transform.ToMatrix(), RenderBoundsObj);
+			return LocalTransformAABBTransform(RenderBoundsObj, transform);
+		}
+		
+		// Faster than (MinMaxAABB)AABB.Transform(transform.ToMatrix(), RenderBoundsObj) ?
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		static MinMaxAABB LocalTransformAABBTransform (in AABB localBounds, in LocalTransform transform) {
+			AABB transformed;
+			transformed.Extents = abs(mul(transform.Rotation, localBounds.Extents)) * transform.Scale;
+			transformed.Center = transform.Position + localBounds.Center;
+			return (MinMaxAABB)transformed;
 		}
 
 		public Asset (Mesh mesh, Material[] materials) {
@@ -353,7 +364,7 @@ namespace CustomEntity {
 			}
 
 			// We can know the number of deleted chunks via gigabrain set theory black magic hackery
-			int deletedChunkCount = (queryChunkCount - trackedChunkCount) - addedChunkCount;
+			int deletedChunkCount = trackedChunkCount - (queryChunkCount - addedChunkCount) ;
 
 			// Now we can early out, though I don't know a better way of finding the deleted chunks without checking all of them
 			if (deletedChunkCount > 0) {
@@ -400,6 +411,9 @@ namespace CustomEntity {
 		public struct ThreadedUploads {
 			public BufferLayout layout;
 			public NativeHashMap<BatchID, ThreadedSparseUploader> uploaders;
+
+			//public bool NeedEndUpload => uploaders.IsCreated;
+			public bool NeedEndUpload;
 			
 			[MethodImpl(MethodImplOptions.AggressiveInlining)]
 			public unsafe void Write (in BatchChunk entry, float3x4* obj2world, float4* color, int count) {
@@ -427,6 +441,7 @@ namespace CustomEntity {
 				u.uploaders.Add(b.batchID, tsu);
 			}
 
+			u.NeedEndUpload = true;
 			return u;
 		}
 		public void EndUpload (ref ThreadedUploads uploads) {
@@ -438,6 +453,8 @@ namespace CustomEntity {
 			}
 
 			uploads.uploaders.Dispose();
+			//uploads.uploaders = default;
+			uploads.NeedEndUpload = false;
 		}
 	}
 	
@@ -608,8 +625,6 @@ namespace CustomEntity {
 			perfUpload.Begin();
 			instanceData.UpdateGpuAllocation(ref brg, query);
 			perfUpload.End();
-			
-			ComputeInstanceDataJobHandle = new JobHandle();
 
 			if (query.IsEmpty)
 				return;
@@ -617,15 +632,22 @@ namespace CustomEntity {
 			UploadInstanceData();
 		}
 		
-		void UploadInstanceData () {
-			var controller = SystemAPI.GetSingleton<ControllerECS>();
+		InstanceData.ThreadedUploads uploads;
 
+		bool test;
+
+		void UploadInstanceData () {
+			//test = true;
+
+			var controller = SystemAPI.GetSingleton<ControllerECS>();
+			
 			c_transformsRO.Update(this);
 			c_dataRO.Update(this);
 			c_Asset.Update(this);
-
-			var uploads = instanceData.BeginUpload();
-
+			
+			uploads = instanceData.BeginUpload();
+			Debug.Log("BeginUpload");
+			
 			ComputeInstanceDataJobHandle = new ComputeInstanceDataJob {
 				LocalTransforms = c_transformsRO,
 				Data = c_dataRO,
@@ -636,8 +658,9 @@ namespace CustomEntity {
 			}.ScheduleParallel(query, Dependency);
 			
 			ComputeInstanceDataJobHandle.Complete();
+			Debug.Log("EndUpload");
 			instanceData.EndUpload(ref uploads);
-
+			
 			// For some reason this is needed, is this right? We want to explictly only finish this job later in OnPerformCulling
 			// I guess so that other jobs which might modify the relevant components for the instance data correctly wait (even though they should never be modified in practice or our rendering is broken)
 			Dependency = ComputeInstanceDataJobHandle;
@@ -653,6 +676,30 @@ namespace CustomEntity {
 			CustomEntityRenderer.inst.dbg.OnCulling(ref cullingContext);
 #endif
 			//Debug.Log("OnPerformCulling");
+
+			//if (test) {
+			//	uploads = instanceData.BeginUpload();
+			//
+			//	var controller = SystemAPI.GetSingleton<ControllerECS>();
+			//	
+			//	c_transformsRO.Update(this);
+			//	c_dataRO.Update(this);
+			//	c_Asset.Update(this);
+			//
+			//	ComputeInstanceDataJobHandle = new ComputeInstanceDataJob {
+			//		LocalTransforms = c_transformsRO,
+			//		Data = c_dataRO,
+			//		Controller = controller,
+			//		Uploads = uploads,
+			//		ChunkBatches = instanceData.ChunkBatches,
+			//		LastSystemVersion = LastSystemVersion,
+			//	}.ScheduleParallel(query, Dependency);
+			//	
+			//	ComputeInstanceDataJobHandle.Complete();
+			//	instanceData.EndUpload(ref uploads);
+			//
+			//	test = false;
+			//}
 
 			if (query.IsEmpty)
 				return new JobHandle();
@@ -695,8 +742,6 @@ namespace CustomEntity {
 				drawData = drawData,
 				cullingOutputCommands = cullingOutput.drawCommands,
 			}.Schedule(chunkVisibilty, 8, allocCmdsJob);
-
-			writeInstancesJob.Complete();
 
 			chunkVisibilty.Dispose(writeInstancesJob);
 			drawData.Dispose(writeInstancesJob);

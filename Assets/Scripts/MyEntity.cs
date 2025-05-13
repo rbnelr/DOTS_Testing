@@ -15,9 +15,6 @@ public struct MyEntityData : IComponentData {
 		var rand = new Random(hash);
 		return Color.HSVToRGB(rand.NextFloat(), 1, 0.6f);
 	}
-	//public static Color RandColor (Entity entity) {
-	//	return RandColor(hash(int2(entity.Index, entity.Version)));
-	//}
 	public static Color RandColor (int idx) {
 		return RandColorH(hash(int2(idx, 0))); // no hash for int?
 	}
@@ -61,7 +58,7 @@ public partial struct DynamicEntityUpdateSystem : ISystem {
 		
 		[BurstCompile]
 		void Execute (Entity entity, ref LocalTransform transform, in MyEntityData data) {
-			var rand = new Unity.Mathematics.Random(hash(int2(entity.Index, entity.Version)));
+			var rand = new Random(hash(int2(entity.Index, entity.Version)));
 			
 			var spin_axis = rand.NextFloat3Direction();
 			var spin_speed = rand.NextFloat(min_speed, max_speed);
